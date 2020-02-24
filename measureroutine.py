@@ -14,7 +14,7 @@
 import numpy as np, time
 from qulab.job import Job
 from qulab.wavepoint import WAVE_FORM as WF
-
+from collections import Iterable
 
 class common():
     def __init__(self,freqall,ats,dc,psg,awg):
@@ -24,6 +24,11 @@ class common():
         self.psg = psg
         self.awg = awg
 
+class qubitCollections():
+    def __inin__(self,qubits):
+        self.f_cavity = np.array([i.f_lo for i in qubits])
+        self.f_ex = np.array([i.f_ex for i in qubits])
+        
 ################################################################################
 ### 设置采集卡
 ################################################################################
@@ -79,7 +84,8 @@ async def resn(f_cavity):
 
 async def S21(qubit,measure,freq=None):
     if freq == None:
-        freq, delta = np.linspace(-4,4,81)*1e6 + qubit.f_lo, qubit.delta
+        freq = np.linspace(-4,4,81)*1e6 + qubit.f_lo
+    delta = qubit.delta
     await measure.psg['psg_lo'].setValue('Output','ON')
     for i in freq:
         await measure.psg['psg_lo'].setValue('Frequency', i)
