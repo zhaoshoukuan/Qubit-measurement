@@ -16,7 +16,7 @@ from qulab.job import Job
 from qulab.wavepoint import WAVE_FORM as WF
 from collections import Iterable
 from tqdm import tqdm_notebook as tqdm
-from qulab.optimize import Collect_Waveform 
+from qulab import computewave as cw
 
 t_list = np.linspace(0,100000,250000)
 t_range = (-90e-6, 10e-6)
@@ -31,7 +31,11 @@ class common():
         self.awg = awg
         self.jpa = jpa
         self.wave = {}
-
+        self.inststate = 0
+        self.t_list = np.linspace(0,100000,250000)
+        self.t_range = (-90e-6,10e-6)
+        self.sample_rate = 2.5e9
+        
 class qubitCollections():
     def __init__(self,qubits,q_target=None):
         self.qubits = {i.q_name:i for i in qubits}
@@ -99,27 +103,36 @@ async def ats_setup(ats,delta,l=1000,repeats=500,awg=0):
 ### 读出混频
 ################################################################################
 
-async def modulation_read(ats,awg,delta,tdelay=1000):
-    global t_list
+async def modulation_read(measure,delta,tdelay=1500,rname=['Readout_I','Readout_Q']):
+    t_list, ats, awg = measure.t_list, measure.ats, measure.awg['awg133']
     twidth, n = tdelay, len(delta)
     wavelen = (twidth // 64) * 64
     if wavelen < twidth:
         wavelen += 64
     f, phi, t_end, width, height = [delta], [[0]*n], [[90000+wavelen]], [[wavelen]], [[1]]
     wf = WF(t_list)
-    await awg.create_waveform(name='Readout_Q', length=len(t_list), format=None)
-    await awg.create_waveform(name='Readout_I', length=len(t_list), format=None)
+    await awg.create_waveform(name=rname[1], length=len(t_list), format=None)
+    await awg.create_waveform(name=rname[0], length=len(t_list), format=None)
     sample = wf.square_envelope(f,phi,t_end,width,height)
-    await awg.update_waveform(sample/np.abs(sample).max(),name='Readout_Q')
+    await awg.update_waveform(sample/np.abs(sample).max(),name=rname[1])
     
     f, phi, t_end, width, height = [delta], [[np.pi/2]*n], [[90000+wavelen]], [[wavelen]], [[1]]
     sample = wf.square_envelope(f,phi,t_end,width,height)
-    await awg.update_waveform(sample/np.abs(sample).max(),name='Readout_I')
+    await awg.update_waveform(sample/np.abs(sample).max(),name=rname[0])
     
     sample = wf.square_wave(t_end=[90145+128/2+wavelen],width=[wavelen],height=[1])
-    await awg.update_marker(name='Readout_Q',mk1=sample)
-    await awg.update_marker(name='Readout_I',mk1=sample)
+    await awg.update_marker(name=rname[1],mk1=sample)
+    await awg.update_marker(name=rname[0],mk1=sample)
     await ats_setup(ats,delta,l=tdelay)
+
+    await awg.use_waveform(name=rname[0],ch=7)
+    await awg.use_waveform(name=rname[1],ch=8)
+    await awg.setValue('Vpp',0.5*n,ch=7)
+    await awg.setValue('Vpp',0.5*n,ch=8)
+
+    await awg.output_on(ch=7)
+    await awg.output_on(ch=8)
+    await awg.run()
     time.sleep(5)
     
 ################################################################################
@@ -127,7 +140,7 @@ async def modulation_read(ats,awg,delta,tdelay=1000):
 ################################################################################
 
 async def modulation_ex(qubit,measure,w=25000,delta_ex=[0]):
-    global t_list
+    t_list = measure.t_list
     wf, Iname, Qname, n = WF(t_list), qubit.q_name+'_I', qubit.q_name+'_Q', len(delta_ex)
     await measure.awg[qubit.inst['ex_awg']].create_waveform(name=Qname, length=len(t_list), format=None)
     await measure.awg[qubit.inst['ex_awg']].create_waveform(name=Iname, length=len(t_list), format=None)
@@ -145,6 +158,7 @@ async def modulation_ex(qubit,measure,w=25000,delta_ex=[0]):
 
     await measure.awg[qubit.inst['ex_awg']].output_on(ch=qubit.inst['ex_ch'][0])
     await measure.awg[qubit.inst['ex_awg']].output_on(ch=qubit.inst['ex_ch'][1])
+    await measure.awg[qubit.inst['ex_awg']].run()
     time.sleep(5)
 
 ################################################################################
@@ -205,7 +219,41 @@ async def QueryInst(measure):
                 state[i] = sm
         finally:
             pass
+    measure.inststate = state
     return state
+
+################################################################################
+### 初始化仪器
+################################################################################
+
+async def InitInst(measure,psgdc=True,awgch=True,clearwaveseq=[]):
+    if psgdc:
+        await close(measure)
+    if awgch:
+        for i in measure.awg:
+            for j in range(8):
+                await measure.awg[i].output_off(ch=j+1)
+    for i in clearwaveseq:
+        await measure.awg[i].stop()
+        await measure.awg[i].clear_waveform_list()
+        await measure.awg[i].clear_sequence_list()
+
+################################################################################
+### 恢复仪器最近状态
+################################################################################
+
+async def RecoverInst(measure):
+    state = measure.inststate
+    for i in state:
+        if 'dc' in i:
+            await measure.dc[i].DC(state[i]['offset'])
+        if 'psg' in i:
+            await measure.psg[i].setValue('Frequency',eval(state[i]['freq'].strip('GHz'))*1e9)
+            await measure.psg[i].setValue('Power',eval(state[i]['power'].strip('dBm')))
+            if state[i]['output'] == '1':
+                await measure.psg[i].setValue('Output','ON')
+            else:
+                await measure.psg[i].setValue('Output','OFF')
 
 ################################################################################
 ### S21
@@ -217,11 +265,11 @@ async def S21(qubit,measure,modulation=False,freq=None):
         f_lo, delta, n = await resn(np.array(qubit.f_lo))
         freq = np.linspace(-2.5,2.5,126)*1e6 + f_lo
         if modulation:
-            await modulation_read(measure.ats,measure.awg['awg133'],delta)
+            await modulation_read(measure,delta)
     await measure.psg['psg_lo'].setValue('Output','ON')
     for i in freq:
         await measure.psg['psg_lo'].setValue('Frequency', i)
-        ch_A, ch_B = await measure.ats.getIQ(hilbert=True)
+        ch_A, ch_B = await measure.ats.getIQ(hilbert=True,offset=True)
         Am, Bm = ch_A.mean(axis=0),ch_B.mean(axis=0)
         theta0 = np.angle(Am) - np.angle(Bm)
         Bm *= np.exp(1j*theta0)
@@ -245,16 +293,16 @@ async def again(qubit,measure,modulation=False):
     await measure.psg['psg_lo'].setValue('Frequency',f_lo)
     if n != 1:
         await ats_setup(measure.ats,delta)
-        await modulation_read(measure.awg['wg133'],delta,n)
+        await modulation_read(measure,delta)
         base = 0
         for i in range(50):
-            ch_A, ch_B = await measure.ats.getIQ(hilbert=True)
+            ch_A, ch_B = await measure.ats.getIQ(hilbert=True,offset=True)
             Am, Bm = ch_A.mean(axis=0),ch_B.mean(axis=0)
             theta0 = np.angle(Am) - np.angle(Bm)
             Bm *= np.exp(1j*theta0)
             base += Am + Bm
         base /= 50
-   
+    measure.base, measure.n, measure.delta = base, n, delta
     return f_lo, delta, n, f_res, base
 
 ################################################################################
@@ -269,6 +317,19 @@ async def S21vsFlux(qubit,measure,current,modulation=False):
         yield [i]*1, f_s21, s_s21
 
 ################################################################################
+### S21vsPower
+################################################################################
+
+async def S21vsPower(qubit,measure,att,com='com7',modulation=False):
+    att_setup = Att_Setup(com)
+    for i in att:
+        att_setup.Att(i)
+        job = Job(S21, (qubit,measure,modulation),auto_save=False, no_bar=True)
+        f_s21, s_s21 = await job.done()
+        yield [i]*1, f_s21, s_s21
+    att_setup.close()
+
+################################################################################
 ### SingleSpec
 ################################################################################
 
@@ -276,7 +337,6 @@ async def singlespec(qubit,measure,freq,modulation=False):
     await jpa_switch(measure,'ON')
     await modulation_ex(qubit,measure)
     f_lo, delta, n, f_res,base = await again(qubit,measure,modulation)
-    measure.base, measure.n = base, n
     await measure.psg[qubit.inst['ex_lo']].setValue('Output','ON')
     for i in freq:
         await measure.psg[qubit.inst['ex_lo']].setValue('Frequency',i)
@@ -307,31 +367,55 @@ async def spec2d(qubit,measure,freq):
         yield [i]*n, f_ss, s_ss
 
 ################################################################################
-### 创建波形及sequence
-################################################################################
-
-async def create_wavelist(measure,kind,para):
-    awg,name,n_wave,length = para
-    @Collect_Waveform(measure.wave,kind)
-    async def create_waveformlist(awg,name,n_wave,length):
-        name_list = []
-        for i in tqdm(name,desc='create_waveformlist'):
-            name_collect = []
-            for j in range(1,n_wave+1):
-                name_w = ''.join((i,'_%d'%j))
-                name_collect.append(name_w)
-                await measure.awg[awg].create_waveform(name=name_w, length=length, format=None) 
-            name_list.append(name_collect)
-        return name_list
-    return create_waveformlist(*para)
-
-################################################################################
 ### Rabi
 ################################################################################
 
-async def rabi(qubit,measure,t,len_data):
-    t = t[1:len_data+1]
+async def rabi(qubit,measure,t_rabi,len_data,comwave=False):
+    t, name = t_rabi[1:len_data+1], ''.join((qubit.inst['ex_awg'],'coherence'))
     t = np.array([t]*measure.n).T
+    await cw.create_wavelist(measure,name,(qubit.inst['ex_awg'],['I','Q'],len(t_rabi),len(measure.t_list)))
+    await cw.genSeq(measure,measure.awg[qubit.inst['ex_awg']],name)
+    await cw.readSeq(measure,measure.awg['awg133'],'Read')
+    if comwave:
+        await cw.Rabi_sequence(measure,name,qubit.inst['ex_awg'],t_rabi)
+    await measure.awg[qubit.inst['ex_awg']].use_sequence(name,channels=[qubit.inst['ex_ch'][0],qubit.inst['ex_ch'][1]])
+    await measure.awg[qubit.inst['ex_awg']].output_on(ch=qubit.inst['ex_ch'][0])
+    await measure.awg[qubit.inst['ex_awg']].output_on(ch=qubit.inst['ex_ch'][1])
+    await ats_setup(measure.ats,measure.delta,l=1500,repeats=len_data,awg=1)
+    await measure.awg[qubit.inst['ex_awg']].query('*OPC?')
+    await measure.awg[qubit.inst['ex_awg']].run()
+    await measure.awg[qubit.inst['ex_awg']].query('*OPC?')
+
+    await measure.psg['psg_lo'].setValue('Output','ON')
+    await measure.psg[qubit.inst['ex_lo']].setValue('Output','ON')
+    for i in range(500):
+        ch_A, ch_B = await measure.ats.getIQ(hilbert=True)
+        Am, Bm = ch_A[1:len_data+1,:],ch_B[1:len_data+1,:]
+        theta0 = np.angle(Am) - np.angle(Bm)
+        Bm *= np.exp(1j*theta0)
+        s = Am + Bm
+        yield t, s - measure.base
+
+################################################################################
+### T1
+################################################################################
+
+async def T1(qubit,measure,t_rabi,len_data,comwave=False):
+    t, name = t_rabi[1:len_data+1], ''.join((qubit.inst['ex_awg'],'coherence'))
+    t = np.array([t]*measure.n).T
+    #await cw.create_wavelist(measure,name,(qubit.inst['ex_awg'],['I','Q'],len(t_rabi),len(measure.t_list)))
+    #await cw.genSeq(measure,measure.awg[qubit.inst['ex_awg']],name)
+    #await cw.readSeq(measure,measure.awg['awg133'],'Read')
+    if comwave:
+        await cw.T1_sequence(measure,name,qubit.inst['ex_awg'],t_rabi,qubit.pi_len)
+    await measure.awg[qubit.inst['ex_awg']].use_sequence(name,channels=[qubit.inst['ex_ch'][0],qubit.inst['ex_ch'][1]])
+    await measure.awg[qubit.inst['ex_awg']].output_on(ch=qubit.inst['ex_ch'][0])
+    await measure.awg[qubit.inst['ex_awg']].output_on(ch=qubit.inst['ex_ch'][1])
+    await ats_setup(measure.ats,measure.delta,l=1500,repeats=len_data,awg=1)
+    await measure.awg[qubit.inst['ex_awg']].query('*OPC?')
+    await measure.awg[qubit.inst['ex_awg']].run()
+    await measure.awg[qubit.inst['ex_awg']].query('*OPC?')
+
     await measure.psg['psg_lo'].setValue('Output','ON')
     await measure.psg[qubit.inst['ex_lo']].setValue('Output','ON')
     for i in range(500):
