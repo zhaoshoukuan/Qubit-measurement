@@ -317,6 +317,18 @@ async def S21vsFlux(qubit,measure,current,modulation=False):
         yield [i]*1, f_s21, s_s21
 
 ################################################################################
+### S21vsFlux_awgoffset
+################################################################################
+
+async def S21vsFlux_awgoffset(qubit,measure,current,modulation=False):
+    for i in current:
+        await measure.awg[qubit.inst['z_awg']].setValue('Offset',i,ch=qubit.inst['z_ch'])
+        await measure.awg[qubit.inst['z_awg']].query('*OPC?')
+        job = Job(S21, (qubit,measure,modulation),auto_save=False, no_bar=True)
+        f_s21, s_s21 = await job.done()
+        yield [i]*1, f_s21, s_s21
+
+################################################################################
 ### S21vsPower
 ################################################################################
 
@@ -408,6 +420,36 @@ async def T1(qubit,measure,t_rabi,len_data,comwave=False):
     #await cw.readSeq(measure,measure.awg['awg133'],'Read')
     if comwave:
         await cw.T1_sequence(measure,name,qubit.inst['ex_awg'],t_rabi,qubit.pi_len)
+    await measure.awg[qubit.inst['ex_awg']].use_sequence(name,channels=[qubit.inst['ex_ch'][0],qubit.inst['ex_ch'][1]])
+    await measure.awg[qubit.inst['ex_awg']].output_on(ch=qubit.inst['ex_ch'][0])
+    await measure.awg[qubit.inst['ex_awg']].output_on(ch=qubit.inst['ex_ch'][1])
+    await ats_setup(measure.ats,measure.delta,l=1500,repeats=len_data,awg=1)
+    await measure.awg[qubit.inst['ex_awg']].query('*OPC?')
+    await measure.awg[qubit.inst['ex_awg']].run()
+    await measure.awg[qubit.inst['ex_awg']].query('*OPC?')
+
+    await measure.psg['psg_lo'].setValue('Output','ON')
+    await measure.psg[qubit.inst['ex_lo']].setValue('Output','ON')
+    for i in range(500):
+        ch_A, ch_B = await measure.ats.getIQ(hilbert=True)
+        Am, Bm = ch_A[1:len_data+1,:],ch_B[1:len_data+1,:]
+        theta0 = np.angle(Am) - np.angle(Bm)
+        Bm *= np.exp(1j*theta0)
+        s = Am + Bm
+        yield t, s - measure.base
+
+################################################################################
+### Ramsey
+################################################################################
+
+async def Ramsey(qubit,measure,t_rabi,len_data,comwave=False):
+    t, name = t_rabi[1:len_data+1], ''.join((qubit.inst['ex_awg'],'coherence'))
+    t = np.array([t]*measure.n).T
+    await cw.create_wavelist(measure,name,(qubit.inst['ex_awg'],['I','Q'],len(t_rabi),len(measure.t_list)))
+    await cw.genSeq(measure,measure.awg[qubit.inst['ex_awg']],name)
+    await cw.readSeq(measure,measure.awg['awg133'],'Read')
+    if comwave:
+        await cw.Ramsey_sequence(measure,name,qubit.inst['ex_awg'],t_rabi,qubit.pi_len)
     await measure.awg[qubit.inst['ex_awg']].use_sequence(name,channels=[qubit.inst['ex_ch'][0],qubit.inst['ex_ch'][1]])
     await measure.awg[qubit.inst['ex_awg']].output_on(ch=qubit.inst['ex_ch'][0])
     await measure.awg[qubit.inst['ex_awg']].output_on(ch=qubit.inst['ex_ch'][1])

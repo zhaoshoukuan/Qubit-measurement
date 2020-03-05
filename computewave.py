@@ -136,3 +136,32 @@ async def T1_sequence(measure,kind,awg,t_rabi,pi_len):
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
         await rabiWave(measure.awg[awg],during=pi_len/1e9,shift=(i+200)*1e-9, name = name_ch)
     # await measure.awg[awg].run()
+
+################################################################################
+### Ramsey波形
+################################################################################
+
+async def ramseyWave(awg,delay,halfpi=75e-9, shift=200e-9, Delta_lo=80e6,name=['Ex_I','Ex_Q']):
+    
+    lo1, lo2 = Expi(2*np.pi*Delta_lo), Expi(2*np.pi*Delta_lo,2*np.pi*3e6*delay)
+    m1 = (CosPulse(halfpi) << halfpi/2) * lo2 << shift
+    m2 = (CosPulse(halfpi) << (halfpi*3/2 + delay)) * lo1 << shift #m1,m2,lo1,lo2所乘位置要考察
+    wav = m1 + m2
+    # lo = Expi(2*np.pi*Delta_lo)
+    # init = (Step(2e-9)<<hafpi) - Step(2e-9)
+    # wav = (init << shift) * lo
+    wav.set_range(*t_range)
+    points = wav.generateData(sample_rate)
+    I, Q = np.real(points), np.imag(points)
+    await awg.update_waveform(I, name = name[0])
+    await awg.update_waveform(Q, name = name[1])
+    #await awg.update_marker(name[1],mk1=points1)
+
+async def Ramsey_sequence(measure,kind,awg,t_rabi,halfpi):
+    # t_range, sample_rate = measure.t_range, measure.sample_rate
+    await measure.awg[awg].stop()
+    time.sleep(5)
+    for j,i in enumerate(tqdm(t_rabi,desc='Ramsey_sequence')):
+        name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
+        await ramseyWave(measure.awg[awg], delay=i/1e9, halfpi=halfpi/1e9, name = name_ch)
+    # await measure.awg[awg].run()
