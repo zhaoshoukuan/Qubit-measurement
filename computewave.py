@@ -165,3 +165,29 @@ async def Ramsey_sequence(measure,kind,awg,t_rabi,halfpi):
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
         await ramseyWave(measure.awg[awg], delay=i/1e9, halfpi=halfpi/1e9, name = name_ch)
     # await measure.awg[awg].run()
+
+################################################################################
+### Z_cross波形
+################################################################################
+
+async def z_crossWave(awg,volt,halfpi,during=300e-9, shift=200e-9,name=['q1_z']):
+
+    init = ((Step(2e-9)<<during) - Step(2e-9)) * volt
+    wav = (init << (shift+halfpi+75e-9)) 
+    wav.set_range(*t_range)
+    points = wav.generateData(sample_rate)
+    
+    I, Q = np.real(points), np.imag(points)
+
+    await awg.update_waveform(I, name[0])
+    #await awg.update_waveform(Q, name[1])
+    
+async def Z_cross_sequence(measure,kind_z,kind_ex,awg_z,awg_ex,v_rabi,halfpi):
+    #t_range, sample_rate = measure.t_range, measure.sample_rate
+    await measure.awg[awg_ex].stop()
+    await measure.awg[awg_z].stop()
+    time.sleep(5)
+    for j,i in enumerate(tqdm(v_rabi,desc='Z_cross_sequence')):
+        name_ch = [measure.wave[kind_ex][0][j],measure.wave[kind_ex][1][j]]
+        await ramseyWave(measure.awg[awg_ex], delay=450/1e9, halfpi=halfpi/1e9, name = name_ch)
+        await z_crossWave(measure.awg[awg_z],volt=i,halfpi=halfpi/1e9,name=[measure.wave[kind_z][0][j]])
