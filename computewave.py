@@ -90,12 +90,12 @@ async def readSeq(measure,awg,kind):
     await awg.create_sequence(kind,len(measure.wave[kind][0])+1,8)
     for j,i in enumerate(measure.wave[kind],start=1):
          await awg.set_seq(i,1,j,seq_name=kind)
-    await measure.awg['awg133'].use_sequence(kind,channels=[7,8])
-    await measure.awg['awg133'].query('*OPC?')
-    await measure.awg['awg133'].output_on(ch=7)
-    await measure.awg['awg133'].output_on(ch=8)
-    await measure.awg['awg133'].run()
-    await measure.awg['awg133'].query('*OPC?')
+    await measure.awg['awgread'].use_sequence(kind,channels=[7,8])
+    await measure.awg['awgread'].query('*OPC?')
+    await measure.awg['awgread'].output_on(ch=7)
+    await measure.awg['awgread'].output_on(ch=8)
+    await measure.awg['awgread'].run()
+    await measure.awg['awgread'].query('*OPC?')
 ################################################################################
 ### Rabi波形
 ################################################################################
@@ -137,7 +137,7 @@ async def Rabi_sequence(measure,kind,awg,t_rabi):
     for j,i in enumerate(tqdm(t_rabi,desc='Rabi_sequence')):
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
         await rabiWave(measure.awg[awg],during=i/1e9, name = name_ch)
-    # await measure.awg[awg].run()
+    await measure.awg[awg].query('*OPC?')
 
 ################################################################################
 ### T1波形
@@ -150,7 +150,7 @@ async def T1_sequence(measure,kind,awg,t_rabi,pi_len):
     for j,i in enumerate(tqdm(t_rabi,desc='T1_sequence')):
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
         await rabiWave(measure.awg[awg],during=pi_len/1e9,shift=(i+200)*1e-9, name = name_ch)
-    # await measure.awg[awg].run()
+    await measure.awg[awg].query('*OPC?')
 
 ################################################################################
 ### Ramsey波形
@@ -180,7 +180,7 @@ async def Ramsey_sequence(measure,kind,awg,t_rabi,halfpi):
     for j,i in enumerate(tqdm(t_rabi,desc='Ramsey_sequence')):
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
         await ramseyWave(measure.awg[awg], delay=i/1e9, halfpi=halfpi/1e9, name = name_ch)
-    # await measure.awg[awg].run()
+    await measure.awg[awg].query('*OPC?')
 
 ################################################################################
 ### Z_cross波形
@@ -207,6 +207,8 @@ async def Z_cross_sequence(measure,kind_z,kind_ex,awg_z,awg_ex,v_rabi,halfpi):
         name_ch = [measure.wave[kind_ex][0][j],measure.wave[kind_ex][1][j]]
         await ramseyWave(measure.awg[awg_ex], delay=450/1e9, halfpi=halfpi/1e9, fdetune=0, name = name_ch)
         await z_crossWave(measure.awg[awg_z],volt=i,halfpi=halfpi/1e9,name=[measure.wave[kind_z][0][j]])
+    await measure.awg[awg_ex].query('*OPC?')
+    await measure.awg[awg_z].query('*OPC?')
 
 ################################################################################
 ### AC-Stark波形
@@ -230,16 +232,77 @@ async def ac_stark_sequence(measure,awg,kind,pilen,t_rabi):
     for j,i in enumerate(tqdm(t_rabi,desc='acStark_sequence')):
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
         await rabiWave(awg_ex,during=pilen/1e9,shift=i*1e-9, name = name_ch)
+    await awg_ex.query('*OPC?')
 
 ################################################################################
 ### RB波形
 ################################################################################
 
-async def rbWave(m):
+def genXY(phi,during,height=1,shift=0e-9,tdelay=0e-9,Delta_lo=80e6,pulse='pi'):
+    shift += 200e-9
+    lo = Expi(2*np.pi*Delta_lo,phi)
+    if pulse == 'pi':
+        m1 = CosPulse(during) << during/2
+        m2 = CosPulse(during) << (during*3/2+tdelay)
+        m = m1 + m2
+    if pulse == 'halfpi':
+        m = CosPulse(during) << during/2
+    wav = (m*height << shift) * lo
+        
+    return wav
+
+def genParas(x,pilen):
+    if x == 'I':
+        paras = (0,0,'pi')
+    elif x == 'X':
+        paras = (0,1,'pi')
+    elif x == 'Xhalf':
+        paras = (0,1,'halfpi')
+    elif x == 'Xnhalf':
+        paras = (np.pi,1,'halfpi')
+    elif x == 'Y':
+        paras = (np.pi/2,1,'pi')
+    elif x == 'Yhalf':
+        paras = (np.pi/2,1,'halfpi')
+    elif x == 'Ynhalf':
+        paras = (3*np.pi/2,1,'halfpi')
+    return paras
+
+async def rbWave(awg,m,pilen,name=['Ex_I','Ex_Q']):
     op = {'1':['I'],'2':['X'],'3':['Xhalf'],'4':['Xnhalf'],'5':['Y'],'6':['Yhalf'],'7':['Ynhalf'],
         '8':['X','Y'],'9':['Xhalf','Yhalf','Xnhalf'],'10':['Xhalf','Ynhalf','Xnhalf'],'11':['Ynhalf','X'],
         '12':['Yhalf','X'],'13':['Xhalf','Y'],'14':['Xnhalf','Y'],'15':['Xhalf','Yhalf','Xhalf'],'16':['Xnhalf','Yhalf','Xnhalf'],
         '17':['Xhalf','Yhalf'],'18':['Xnhalf','Yhalf'],'19':['Xhalf','Ynhalf'],'20':['Xnhalf','Ynhalf'],
         '21':['Ynhalf','Xnhalf'],'22':['Ynhalf','Xhalf'],'23':['Yhalf','Xnhalf'],'24':['Yhalf','Xhalf']}
+
     mseq, invertseq = mx.cliffordGroup_single(m)
+    rotseq = []
+    for i in mseq:
+        rotseq += op[i]
+    rotseq.append(invertseq)
+    shift, waveseq = 0, 0
+    for i in rotseq[::-1]:
+        paras = genParas(i,pilen)
+        wav = genXY(phi=paras[0],during=pilen,height=paras[1],pulse=paras[2])
+        waveseq += wav << shift
+        if paras[2] == 'pi':
+            shift += 2*pilen
+        if paras[2] == 'halfpi':
+            shift += pilen
+
+    waveseq.set_range(*t_range)
+    points = waveseq.generateData(sample_rate)
+    I, Q = np.real(points), np.imag(points)
+    await awg.update_waveform(I, name[0])
+    await awg.update_waveform(Q, name[1])
     
+async def rb_sequence(awg,kind,mlist,pilen):
+    await awg.stop()
+    await awg.query('*OPC?')
+    for j,i in enumerate(tqdm(mlist,desc='RB_sequence')):
+        name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
+        await rbWave(awg,i,pilen*1e-9,name=name_ch)
+    await awg.query('*OPC?')
+
+
+
