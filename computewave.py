@@ -94,6 +94,7 @@ async def readSeq(measure,awg,kind):
     await measure.awg['awg133'].output_on(ch=7)
     await measure.awg['awg133'].output_on(ch=8)
     await measure.awg['awg133'].run()
+    await measure.awg['awg133'].query('*OPC?')
 ################################################################################
 ### Rabi波形
 ################################################################################
@@ -105,14 +106,27 @@ async def rabiWave(awg,during=75e-9, shift=200e-9, Delta_lo=80e6,name=['Ex_I','E
     m2 = CosPulse(during) << during*3/2
     m = m1 + m2
     wav = (m << shift) * lo
+
+    # lo = Expi(2*np.pi*Delta_lo)
+    # m1 = (Step(2e-9)<<during) - Step(2e-9)
+    # m2 = ((Step(2e-9)<<during) - Step(2e-9)) << during
+    # wav = ((m1 + m2) << shift) * lo
+
     # lo = Expi(2*np.pi*Delta_lo)
     # init = (Step(2e-9)<<during) - Step(2e-9)
     # wav = (init << shift) * lo
+
     wav.set_range(*t_range)
     points = wav.generateData(sample_rate)
     I, Q = np.real(points), np.imag(points)
     await awg.update_waveform(I, name = name[0])
     await awg.update_waveform(Q, name = name[1])
+
+    init1 = (Step(0e-9)<<during) - Step(0e-9)
+    wav1 = (init1 << shift) 
+    wav1.set_range(*t_range)
+    points1 = wav1.generateData(sample_rate)
+    await awg.update_marker(name=name[1],mk1=points1)
     #await awg.update_marker(name[1],mk1=points1)
 
 async def Rabi_sequence(measure,kind,awg,t_rabi):
@@ -141,15 +155,16 @@ async def T1_sequence(measure,kind,awg,t_rabi,pi_len):
 ### Ramsey波形
 ################################################################################
 
-async def ramseyWave(awg,delay,halfpi=75e-9, shift=200e-9, Delta_lo=80e6,name=['Ex_I','Ex_Q']):
+async def ramseyWave(awg,delay,halfpi=75e-9,fdetune=3e6, shift=200e-9, Delta_lo=80e6,name=['Ex_I','Ex_Q']):
     
-    lo1, lo2 = Expi(2*np.pi*Delta_lo), Expi(2*np.pi*Delta_lo,2*np.pi*3e6*delay)
-    m1 = (CosPulse(halfpi) << halfpi/2) * lo2 << shift
-    m2 = (CosPulse(halfpi) << (halfpi*3/2 + delay)) * lo1 << shift #m1,m2,lo1,lo2所乘位置要考察
-    wav = m1 + m2
-    # lo = Expi(2*np.pi*Delta_lo)
-    # init = (Step(2e-9)<<hafpi) - Step(2e-9)
-    # wav = (init << shift) * lo
+    lo2, lo1 = Expi(2*np.pi*Delta_lo), Expi(2*np.pi*Delta_lo,2*np.pi*fdetune*delay)
+    m1 = (CosPulse(halfpi) << halfpi/2) * lo1 
+    m2 = (CosPulse(halfpi) << (halfpi*3/2 + delay)) * lo2  #m1,m2,lo1,lo2所乘位置要考察
+    wav = (m1 + m2) << shift
+    # lo2, lo1 = Expi(2*np.pi*Delta_lo), Expi(2*np.pi*Delta_lo,2*np.pi*fdetune*delay)
+    # m1 = (Step(2e-9)<<halfpi) - Step(2e-9) *lo1
+    # m2 = (((Step(2e-9)<<halfpi) - Step(2e-9)) << (halfpi + delay)) * lo2
+    # wav = (m1 + m2) << shift
     wav.set_range(*t_range)
     points = wav.generateData(sample_rate)
     I, Q = np.real(points), np.imag(points)
@@ -189,5 +204,28 @@ async def Z_cross_sequence(measure,kind_z,kind_ex,awg_z,awg_ex,v_rabi,halfpi):
     time.sleep(5)
     for j,i in enumerate(tqdm(v_rabi,desc='Z_cross_sequence')):
         name_ch = [measure.wave[kind_ex][0][j],measure.wave[kind_ex][1][j]]
-        await ramseyWave(measure.awg[awg_ex], delay=450/1e9, halfpi=halfpi/1e9, name = name_ch)
+        await ramseyWave(measure.awg[awg_ex], delay=450/1e9, halfpi=halfpi/1e9, fdetune=0, name = name_ch)
         await z_crossWave(measure.awg[awg_z],volt=i,halfpi=halfpi/1e9,name=[measure.wave[kind_z][0][j]])
+
+################################################################################
+### AC-Stark波形
+################################################################################
+
+async def ac_stark_sequence(measure,awg,kind,pilen,t_rabi):
+    awg_read, awg_ex = measure.awg['awgread'], measure.awg[awg]
+    await awg_ex.stop()
+    await awg_read.stop() 
+    time.sleep(5)
+    lo = Expi(2*np.pi*50e6)
+    m1 = (Step(0e-9)<<measure.wavelen*1e-9) - Step(0e-9) >> measure.wavelen*1e-9
+    m2 = ((Step(0e-9)<<measure.wavelen*1e-9) - Step(0e-9)) << 500e-9
+    wav = (m1 + m2) * lo
+    wav.set_range(*t_range)
+    points = wav.generateData(sample_rate)
+    I, Q = np.real(points), np.imag(points)
+    await awg_read.update_waveform(I, name = 'Readout_I')
+    await awg_read.update_waveform(Q, name = 'Readout_Q')
+
+    for j,i in enumerate(tqdm(t_rabi,desc='acStark_sequence')):
+        name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
+        await rabiWave(awg_ex,during=pilen/1e9,shift=i*1e-9, name = name_ch)
