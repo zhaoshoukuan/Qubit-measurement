@@ -275,11 +275,10 @@ async def rbWave(awg,m,pilen,name=['Ex_I','Ex_Q']):
         '17':['Xhalf','Yhalf'],'18':['Xnhalf','Yhalf'],'19':['Xhalf','Ynhalf'],'20':['Xnhalf','Ynhalf'],
         '21':['Ynhalf','Xnhalf'],'22':['Ynhalf','Xhalf'],'23':['Yhalf','Xnhalf'],'24':['Yhalf','Xhalf']}
 
-    mseq, invertseq = mx.cliffordGroup_single(m)
+    mseq = mx.cliffordGroup_single(m)
     rotseq = []
     for i in mseq:
         rotseq += op[i]
-    rotseq.append(invertseq)
     shift, waveseq = 0, 0
     for i in rotseq[::-1]:
         paras = genParas(i,pilen)
