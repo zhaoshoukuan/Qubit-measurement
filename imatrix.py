@@ -67,5 +67,5 @@ def cliffordGroup_single(m):
 #     for i in Clifford:
 #         if (np.abs(np.abs(np.dot(invertelement,Clifford[i]))-np.mat([[1,0],[0,1]]))<1e-5).all():
 #             invertseq = i
-
-    return mseq, invertseq
+    mseq.append(invertseq)
+    return mseq
