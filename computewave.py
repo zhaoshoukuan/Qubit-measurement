@@ -16,6 +16,7 @@ from qulab.wavepoint import WAVE_FORM as WF
 from qulab.waveform import CosPulseDrag, Expi, DC, Step, Gaussian, CosPulse
 from tqdm import tqdm_notebook as tqdm
 from qulab.optimize import Collect_Waveform 
+from qulab import imatrix as mx
 
 
 t_list = np.linspace(0,100000,250000)
@@ -229,3 +230,16 @@ async def ac_stark_sequence(measure,awg,kind,pilen,t_rabi):
     for j,i in enumerate(tqdm(t_rabi,desc='acStark_sequence')):
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
         await rabiWave(awg_ex,during=pilen/1e9,shift=i*1e-9, name = name_ch)
+
+################################################################################
+### RB波形
+################################################################################
+
+async def rbWave(m):
+    op = {'1':['I'],'2':['X'],'3':['Xhalf'],'4':['Xnhalf'],'5':['Y'],'6':['Yhalf'],'7':['Ynhalf'],
+        '8':['X','Y'],'9':['Xhalf','Yhalf','Xnhalf'],'10':['Xhalf','Ynhalf','Xnhalf'],'11':['Ynhalf','X'],
+        '12':['Yhalf','X'],'13':['Xhalf','Y'],'14':['Xnhalf','Y'],'15':['Xhalf','Yhalf','Xhalf'],'16':['Xnhalf','Yhalf','Xnhalf'],
+        '17':['Xhalf','Yhalf'],'18':['Xnhalf','Yhalf'],'19':['Xhalf','Ynhalf'],'20':['Xnhalf','Ynhalf'],
+        '21':['Ynhalf','Xnhalf'],'22':['Ynhalf','Xhalf'],'23':['Yhalf','Xnhalf'],'24':['Yhalf','Xhalf']}
+    mseq, invertseq = mx.cliffordGroup_single(m)
+    
