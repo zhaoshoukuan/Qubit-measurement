@@ -254,13 +254,15 @@ STEP = 2
 GAUSSIAN = 3
 COS = 4
 SIN = 5
+EXPI = 6
 
 _baseFunc = {
     LINEAR: lambda t, k: k * t,
     STEP: lambda t, edge: special.erf(5 * t / edge) / 2 + 0.5,
     GAUSSIAN: lambda t, c: np.exp(-0.5 * (t / c)**2),
     COS: lambda t, w: np.cos(w * t),
-    SIN: lambda t, w: np.sin(w * t)
+    SIN: lambda t, w: np.sin(w * t),
+    EXPI: lambda t, w, phi: np.exp(1j*(w*t+phi))
 }
 
 
@@ -289,3 +291,10 @@ def cos(w, phi=0):
 
 def sin(w, phi=0):
     return cos(w, phi - np.pi / 2)
+
+def cosPulse(width):
+    cos = _basic_wave(COS, 2*np.pi/width)
+    pulse = _mul(_add(cos, _const(1)), _const(0.5))
+    return Waveform(
+        bounds=(-0.5 * width, 0.5 * width, +np.inf),
+        seq=(_zero, pulse, _zero))

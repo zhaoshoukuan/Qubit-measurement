@@ -283,7 +283,7 @@ async def rbWave(awg,m,pilen,name=['Ex_I','Ex_Q']):
     for i in rotseq[::-1]:
         paras = genParas(i,pilen)
         wav = genXY(phi=paras[0],during=pilen,height=paras[1],pulse=paras[2])
-        waveseq += wav << shift
+        waveseq += (wav << shift)
         if paras[2] == 'pi':
             shift += 2*pilen
         if paras[2] == 'halfpi':
@@ -295,13 +295,11 @@ async def rbWave(awg,m,pilen,name=['Ex_I','Ex_Q']):
     await awg.update_waveform(I, name[0])
     await awg.update_waveform(Q, name[1])
     
-async def rb_sequence(awg,kind,mlist,pilen):
+async def rb_sequence(measure,awg,kind,mlist,pilen):
+    awg = measure.awg[awg]
     await awg.stop()
     await awg.query('*OPC?')
     for j,i in enumerate(tqdm(mlist,desc='RB_sequence')):
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
         await rbWave(awg,i,pilen*1e-9,name=name_ch)
     await awg.query('*OPC?')
-
-
-

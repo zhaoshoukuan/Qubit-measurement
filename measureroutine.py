@@ -460,7 +460,7 @@ async def rabi(qubit,measure,t_rabi,len_data,comwave=False):
         theta0 = np.angle(Am) - np.angle(Bm)
         Bm *= np.exp(1j*theta0)
         s = Am + Bm
-        yield t, s
+        yield t, s - measure.base
 
 ################################################################################
 ### AC-Stark（XY与Readout时序矫正)
@@ -504,21 +504,46 @@ async def acStark(qubit,measure,t_rabi,len_data,comwave=False):
 ### 优化读出点
 ################################################################################
 
-async def readOp(qubit,measure,pilen,modulation=False,freq=None):
-    f, s = [], []
+async def readOp(qubit,measure,modulation=False,freq=None):
+    pilen = qubit.pi_len/1e9
     awg, qname = measure.awg[qubit.inst['ex_awg']], [qubit.q_name+'_I', qubit.q_name+'_Q']
+    await awg.create_waveform(name=qname[0], length=len(t_list), format=None)
+    await awg.create_waveform(name=qname[1], length=len(t_list), format=None)
     await cw.rabiWave(awg,during=pilen,name=qname)
     await awg.use_waveform(name=qname[0],ch=qubit.inst['ex_ch'][0])
     await awg.use_waveform(name=qname[1],ch=qubit.inst['ex_ch'][1])
+    await awg.query('*OPC?')
     await awg.output_on(ch=qubit.inst['ex_ch'][0])
     await awg.output_on(ch=qubit.inst['ex_ch'][1])
-    for i in ['OFF','ON']:
+    for j, i in enumerate(['OFF','ON']):
         await measure.psg[qubit.inst['ex_lo']].setValue('Output',i)
         job = Job(S21, (qubit,measure,modulation),auto_save=False,max=126)
         f_s21, s_s21 = await job.done()
-        f.append(f_s21)
-        s.append(s_s21)
-    return f, s
+        n = np.shape(s_s21)[1]
+        yield [j]*n, f_s21, s_s21
+
+################################################################################
+### 临界判断
+################################################################################
+
+async def threshHold(qubit,measure):
+    pilen = qubit.pi_len/1e9
+    await ats_setup(measure.ats,measure.delta,l=measure.wavelen,repeats=5000)
+    awg, qname = measure.awg[qubit.inst['ex_awg']], [qubit.q_name+'_I', qubit.q_name+'_Q']
+    await awg.create_waveform(name=qname[0], length=len(t_list), format=None)
+    await awg.create_waveform(name=qname[1], length=len(t_list), format=None)
+    await cw.rabiWave(awg,during=pilen,name=qname)
+    await awg.use_waveform(name=qname[0],ch=qubit.inst['ex_ch'][0])
+    await awg.use_waveform(name=qname[1],ch=qubit.inst['ex_ch'][1])
+    await awg.query('*OPC?')
+    await awg.output_on(ch=qubit.inst['ex_ch'][0])
+    await awg.output_on(ch=qubit.inst['ex_ch'][1])
+    for j, i in enumerate(['OFF','ON']):
+        await measure.psg[qubit.inst['ex_lo']].setValue('Output',i)
+        ch_A, ch_B = await measure.ats.getIQ(hilbert=False,offset=False)
+        s = ch_A + 1j*ch_B
+        yield j, s
+
 
 ################################################################################
 ### T1
@@ -622,14 +647,14 @@ async def Z_cross(qubit_ex,qubit_z,measure,v_rabi,len_data,comwave=False):
 ################################################################################
 
 async def RB(qubit_ex,measure,mlist,len_data,comwave=False):
-    t, name_ex = mlist[1:len_data+1], ''.join((qubit_ex.inst['ex_awg'],'coherence'))
+    t, name_ex = mlist[1:len_data+1], ''.join((qubit_ex.inst['ex_awg'],'rb'))
     t = np.array([t]*measure.n).T
     await cw.create_wavelist(measure,name_ex,(qubit_ex.inst['ex_awg'],['I','Q'],len(mlist),len(measure.t_list)))
     await cw.genSeq(measure,measure.awg[qubit_ex.inst['ex_awg']],name_ex)
-    await cw.readSeq(measure,measure.awg['awgread'],'Read')
     if comwave:
-        await cw.rb_sequence(measure.awg[qubit_ex.inst['ex_awg']],name_ex,mlist,qubit_ex.pi_len)
+        await cw.rb_sequence(measure,qubit_ex.inst['ex_awg'],name_ex,mlist,qubit_ex.pi_len)
     await measure.awg[qubit_ex.inst['ex_awg']].use_sequence(name_ex,channels=[qubit_ex.inst['ex_ch'][0],qubit_ex.inst['ex_ch'][1]])
+    await cw.readSeq(measure,measure.awg['awgread'],'Read')
     await measure.awg[qubit_ex.inst['ex_awg']].output_on(ch=qubit_ex.inst['ex_ch'][0])
     await measure.awg[qubit_ex.inst['ex_awg']].output_on(ch=qubit_ex.inst['ex_ch'][1])
     await measure.awg[qubit_ex.inst['ex_awg']].query('*OPC?')

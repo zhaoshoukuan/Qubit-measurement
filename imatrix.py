@@ -47,25 +47,25 @@ Clifford = {'1':I,
            '24':Yhalf*Xhalf}
 
 def cliffordGroup_single(m):
-
+    
     mseq = np.random.randint(low=1,high=24,size=m)
     mseq = [str(mseq[i]) for i in range(len(mseq))]
     invertelement = np.mat([[1,0],[0,1]])
     for i in mseq[::-1]:
         invertelement = np.dot(invertelement,Clifford[i])
 
-    invertelement = invertelement.I
+    invertelement, invertseq = invertelement.I, []
     for i in Clifford:
-        index0, index1 = np.argwhere(invertelement!=0)[:,0][0], np.argwhere(invertelement!=0)[:,1][0]
+        index0, index1 = np.argwhere(np.abs(invertelement)>1e-5)[:,0][0], np.argwhere(np.abs(invertelement)>1e-5)[:,1][0]
         phase = np.angle(invertelement[index0,index1])
         d = invertelement*np.exp(-1j*phase)
         phase2 = np.angle(Clifford[i][index0,index1])
         dtarget = Clifford[i]*np.exp(-1j*phase2)
-        if (np.abs(dtarget-d)<0.01).all():
-            invertseq = i
-
-#     for i in Clifford:
-#         if (np.abs(np.abs(np.dot(invertelement,Clifford[i]))-np.mat([[1,0],[0,1]]))<1e-5).all():
-#             invertseq = i
-    mseq.append(invertseq)
+        if ((np.abs(dtarget-d))<1e-5).all():
+            invertseq.append(i)
+    if len(invertseq) == 1:
+        mseq += invertseq
+    else:
+        print(len(invertseq))
+        raise Exception('Find so many')
     return mseq
