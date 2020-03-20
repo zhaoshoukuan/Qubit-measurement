@@ -48,6 +48,8 @@ Clifford = {'1':I,
 
 def cliffordGroup_single(m):
     
+    if m == 0:
+        return []
     mseq = np.random.randint(low=1,high=24,size=m)
     mseq = [str(mseq[i]) for i in range(len(mseq))]
     invertelement = np.mat([[1,0],[0,1]])
@@ -65,6 +67,7 @@ def cliffordGroup_single(m):
             invertseq.append(i)
     if len(invertseq) == 1:
         mseq += invertseq
+
     else:
         print(len(invertseq))
         raise Exception('Find so many')
