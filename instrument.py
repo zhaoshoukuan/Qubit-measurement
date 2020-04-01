@@ -17,6 +17,7 @@ from qulab import waveform_new as wn
 from tqdm import tqdm_notebook as tqdm
 from qulab.optimize import Collect_Waveform 
 from qulab import imatrix as mx
+from qulab import computewave as cw
 
 
 class AWG():
@@ -95,29 +96,60 @@ class qubitCollections():
                     if state[i]['ex'] != 0:
                         fex2.append((i,self.qubits[i].f_ex[0]))        
 
-        qall['psg_lo'] = {'Frequncy':self.f_lo}
-        qall['awg_read']['ch'+str(7)] = {'Frequency':self.delta}
-        qall['awg_read']['ch'+str(8)] = {'Frequency':self.delta}
+        qall['psg_lo'] = {'Frequency':self.f_lo}
+        qall['awg_read']['ch'+str(7)] = [('Frequency',self.delta)]
+        qall['awg_read']['ch'+str(8)] = [('Frequency',self.delta)]
 
         for i, j in enumerate(self.qubits):
             qall['dc'][self.qubits[j].inst['dc']] = self.bias_cross[i]
-            qall[self.qubits[j].inst['z_awg']]['ch'+str(self.qubits[j].inst['z_ch'])] = {'Volt':self.bias_cross_z[i]}
+            qall[self.qubits[j].inst['z_awg']]['ch'+str(self.qubits[j].inst['z_ch'])] = [('Volt',self.bias_cross_z[i])]
             if fex1 != []:
                 ex_lo1, delta_ex1 = self.exMixing(fex1)
-                qall['psg_ex1'] = {'Frequency':ex_lo1}
+                qall['psg_ex1'] = [('Frequency',ex_lo1)]
                 if j in delta_ex1:
                     delta_ex = delta_ex1
                     for k in self.qubits[j].inst['ex_ch']:
-                        qall[self.qubits[j].inst['ex_awg']]['ch'+str(k)] = {'Frequency':delta_ex[j]}
+                        qall[self.qubits[j].inst['ex_awg']]['ch'+str(k)] = [('Frequency',delta_ex[j])]
             if fex2 != []:
                 ex_lo2, delta_ex2 = fex2[0][1], {fex2[0][0]:0}
-                qall['psg_ex2'] = {'Frequency':ex_lo2}
+                qall['psg_ex2'] = [('Frequency',ex_lo2)]
                 if j in delta_ex2:
                     delta_ex = delta_ex2
                     for k in self.qubits[j].inst['ex_ch']:
-                        qall[self.qubits[j].inst['ex_awg']]['ch'+str(k)] = {'Frequency':delta_ex[j]}
+                        qall[self.qubits[j].inst['ex_awg']]['ch'+str(k)] = [('Frequency',delta_ex[j])]
         self.qall = qall
 
             
 
+async def instSet(func,*args,**kw):
+    measure, qubits = args[0], args[1]
+    channel = {'ch%d'%i:i for i in range(1,9,1)}
+    for i in qubits.qall['dc']:
+        measure.dc[i].DC(qubits.qall['dc'][i])
 
+    for i in qubits.qall['psg']:
+        for j in qubits.qall['psg'][i]:
+            measure.psg[i].setValue(j[0],j[1])
+    for i in ['awg131','awg132','awg133','awg134','awg_read']:
+        if qubits.qall[i] != {}:
+            name = ''.join((i,qubits.qall[i][]))
+            await func(i,qubits.qall[i][0][1],*args,**kw)
+
+async def T1(qubit,measure,t_rabi,len_data,comwave=False):
+    t, name = t_rabi[1:len_data+1], ''.join((qubit.inst['ex_awg'],'coherence'))
+    t = np.array([t]*measure.n).T
+    await cw.create_wavelist(measure,name,(qubit.inst['ex_awg'],['I','Q'],len(t_rabi),len(measure.t_list)))
+    await cw.genSeq(measure,measure.awg[qubit.inst['ex_awg']],name)
+    if comwave:
+        await cw.T1_sequence(measure,name,qubit.inst['ex_awg'],t_rabi,qubit.pi_len)
+    await measure.awg[qubit.inst['ex_awg']].use_sequence(name,channels=[qubit.inst['ex_ch'][0],qubit.inst['ex_ch'][1]])
+    await measure.awg[qubit.inst['ex_awg']].query('*OPC?')
+    await cw.readSeq(measure,measure.awg['awgread'],'Read')
+    await measure.awg[qubit.inst['ex_awg']].output_on(ch=qubit.inst['ex_ch'][0])
+    await measure.awg[qubit.inst['ex_awg']].output_on(ch=qubit.inst['ex_ch'][1])
+    await measure.awg[qubit.inst['ex_awg']].run()
+    await measure.awg[qubit.inst['ex_awg']].query('*OPC?')
+
+    await measure.psg['psg_lo'].setValue('Output','ON')
+    await measure.psg[qubit.inst['ex_lo']].setValue('Output','ON')
+    
