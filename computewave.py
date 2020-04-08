@@ -116,50 +116,51 @@ async def awgDC(awg,wavname,volt):
 ### Rabi波形
 ################################################################################
 
-async def rabiWave(awg,during=75e-9, shift=200e-9, Delta_lo=80e6,name=['Ex_I','Ex_Q']):
+async def rabiWave(awg,amp=1, during=75e-9,nwave=1, shift=200e-9, Delta_lo=80e6,name=['Ex_I','Ex_Q']):
     
     # lo = Expi(2*np.pi*Delta_lo)
     # m1 = CosPulse(during) << during/2
     # m2 = CosPulse(during) << during*3/2
     # m = m1 + m2
     # wav = (m << shift) * lo
-
+    
     # lo = Expi(2*np.pi*Delta_lo)
-    # m1 = (Step(2e-9)<<during) - Step(2e-9)
-    # m2 = ((Step(2e-9)<<during) - Step(2e-9)) << during
-    # wav = ((m1 + m2) << shift) * lo
+    # init = (Step(2e-9)<<2*during) - Step(2e-9)
+    # wav = (init << shift) * lo
 
-    lo = Expi(2*np.pi*Delta_lo)
-    init = (Step(2e-9)<<2*during) - Step(2e-9)
-    wav = (init << shift) * lo
+    # wav.set_range(*t_range)
+    # points = wav.generateData(sample_rate)
+    # I, Q = np.real(points), np.imag(points)
 
-    wav.set_range(*t_range)
-    points = wav.generateData(sample_rate)
-    I, Q = np.real(points), np.imag(points)
-    # phi = 0
-    # wav_I = (((wn.cosPulse(during) << (shift+during/2))) +((wn.cosPulse(during) << (shift+during/2*3)))) * wn.cos(2*np.pi*Delta_lo,phi)
-    # wav_Q = (((wn.cosPulse(during) << (shift+during/2))) +((wn.cosPulse(during) << (shift+during/2*3)))) * wn.sin(2*np.pi*Delta_lo,phi)
-    # I, Q = wav_I(t_new), wav_Q(t_new)
-    # cosPulse = (((wn.cosPulse(during) << (shift+during/2))) +((wn.cosPulse(during) << (shift+during/2*3))))
-    # wav_I, wav_Q = wn.mixing(cosPulse,phase=0.0,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
-    # I, Q = wav_I(t_new), wav_Q(t_new)
+    # pulse = wn.square(2*during) << (during+shift)
+    # wav_I, wav_Q = wn.mixing(pulse,phase=0.0,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.14312,DRAGScaling=None)
+    pulse = wn.zero()
+    for i in range(nwave):
+        pulse += (((wn.cosPulse(during) << (shift+during/2))) + ((wn.cosPulse(during) << (shift+during/2*3)))) * amp << 2*i*during
+    wav_I, wav_Q = wn.mixing(pulse,phase=0.0,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.14312,DRAGScaling=1/135e6/2)
+    I, Q = wav_I(t_new), wav_Q(t_new)
+
     await awg.update_waveform(I, name = name[0])
-    await awg.update_waveform(Q, name = name[1])
+    await awg.update_waveform(Q*0.9423, name = name[1])
 
     init1 = (Step(0e-9) << 2*during) - Step(0e-9)
     wav1 = (init1 << shift) 
     wav1.set_range(*t_range)
     points1 = wav1.generateData(sample_rate)
     await awg.update_marker(name=name[1],mk1=points1)
-    #await awg.update_marker(name[1],mk1=points1)
+    # init2 = (Step(0e-9) << 2.1*during) - Step(0e-9)
+    # wav2 = (init2 << -30e-9) 
+    # wav2.set_range(*t_range)
+    # points2 = wav2.generateData(sample_rate)
+    # await awg.update_marker(name='Readout_I',mk1=points2)
 
-async def Rabi_sequence(measure,kind,awg,t_rabi):
+async def Rabi_sequence(measure,kind,awg,t_rabi,nwave=1):
     # t_range, sample_rate = measure.t_range, measure.sample_rate
     await measure.awg[awg].stop()
     await measure.awg[awg].query('*OPC?')
     for j,i in enumerate(tqdm(t_rabi,desc='Rabi_sequence')):
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
-        await rabiWave(measure.awg[awg],during=i/1e9, name = name_ch)
+        await rabiWave(measure.awg[awg],amp=1,during=i/1e9,nwave=nwave, name = name_ch)
     await measure.awg[awg].query('*OPC?')
 
 ################################################################################
@@ -176,6 +177,40 @@ async def T1_sequence(measure,kind,awg,t_rabi,pi_len):
     await measure.awg[awg].write('*WAI')
 
 ################################################################################
+### Ramsey及SpinEcho,CPMG, PDD波形
+################################################################################
+
+async def coherenceWave(awg,t_run,during=75e-9,n_wave=0,seqtype='CPMG',detune=3e6,shift=200e-9,Delta_lo=80e6,name=['Ex_I','Ex_Q']):
+    
+    pulse1 = wn.square(during) << (during/2+shift)
+    wavI1, wavQ1 = wn.mixing(pulse1,phase=2*np.pi*detune*t_run,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
+    pulse3 = wn.square(during) << (t_run+(2*n_wave+1.5)*during+shift)
+    wavI3, wavQ3 = wn.mixing(pulse3,phase=0,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
+    if seqtype == 'CPMG':
+        pulse2, step = wn.zero(), t_run / n_wave
+        for i in range(n_wave):
+            pulse2 += wn.square(2*during) << ((i+0.5)*step+(i+1)*2*during+shift)
+        wavI2, wavQ2 = wn.mixing(pulse2,phase=np.pi/2,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
+    if seqtype == 'PDD':
+        pulse2, step = wn.zero(), t_run / (n_wave + 1)
+        for i in range(n_wave):
+            pulse2 += wn.square(2*during) << ((i+1)*step+(i+1)*2*during+shift)
+        wavI2, wavQ2 = wn.mixing(pulse2,phase=np.pi/2,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
+    wavI, wavQ = wavI1 + wavI2 + wavI3, wavQ1 + wavQ2 + wavQ3
+    I, Q = wavI(t_new), wavQ(t_new)
+    await awg.update_waveform(I, name[0])
+    await awg.update_waveform(Q, name[1])
+
+async def Coherence_sequence(measure,kind,awg,t_rabi,halfpi,n_wave=0,seqtype='CPMG',detune=3e6):
+    # t_range, sample_rate = measure.t_range, measure.sample_rate
+    await measure.awg[awg].stop()
+    time.sleep(5)
+    for j,i in enumerate(tqdm(t_rabi,desc='Ramsey_sequence')):
+        name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
+        await coherenceWave(measure.awg[awg],i/1e9,halfpi/1e9,n_wave,seqtype,detune,name=name_ch)
+    await measure.awg[awg].write('*WAI')
+
+################################################################################
 ### Ramsey波形
 ################################################################################
 
@@ -185,37 +220,22 @@ async def ramseyWave(awg,delay,halfpi=75e-9,fdetune=0e6, shift=200e-9, Delta_lo=
     # m1 = (CosPulse(halfpi) << halfpi/2)
     # m2 = (CosPulse(halfpi) << (halfpi*3/2 + delay))  #m1,m2,lo1,lo2所乘位置要考察
     # wav = (m1 + m2) << shift
-    lo2, lo1 = Expi(2*np.pi*Delta_lo), Expi(2*np.pi*Delta_lo,2*np.pi*fdetune*delay)
-    m1 = ((Step(2e-9)<<halfpi) - Step(2e-9) << shift) *lo1
-    m2 = (((Step(2e-9)<<halfpi) - Step(2e-9)) << (shift+halfpi + delay)) * lo2
-    wav = (m1 + m2) 
 
-    wav.set_range(*t_range)
-    points = wav.generateData(sample_rate)
-    I, Q = np.real(points), np.imag(points)
-    # lo1 = Expi(2*np.pi*Delta_lo,0*np.pi*1e6*delay)
-    # lo2 = Expi(2*np.pi*Delta_lo)
-    # init1 = ((Step(2e-9)<<halfpi) - Step(2e-9))*lo1
-    # init2 = (((Step(2e-9)<<halfpi) - Step(2e-9)) << (delay+halfpi))*lo2
-    # init = init1 + init2
-    # wav = (init >> shift) 
+    # lo2, lo1 = Expi(2*np.pi*Delta_lo), Expi(2*np.pi*Delta_lo,2*np.pi*fdetune*delay)
+    # m1 = ((Step(2e-9)<<halfpi) - Step(2e-9) << shift) *lo1
+    # m2 = (((Step(2e-9)<<halfpi) - Step(2e-9)) << (shift+halfpi + delay)) * lo2
+    # wav = (m1 + m2) 
+
     # wav.set_range(*t_range)
     # points = wav.generateData(sample_rate)
-    
     # I, Q = np.real(points), np.imag(points)
-
-    # phi = 2*np.pi*fdetune*delay
-    # wav_I = (((wn.cosPulse(halfpi) << (shift+halfpi/2))) +((wn.cosPulse(halfpi) << (delay+shift+halfpi/2*3)))) \
-    #     * wn.cos(2*np.pi*Delta_lo,phi)
-    # wav_Q = (((wn.cosPulse(halfpi) << (shift+halfpi/2))) +((wn.cosPulse(halfpi) << (delay+shift+halfpi/2*3)))) \
-    #     * wn.sin(2*np.pi*Delta_lo,phi)
-    # I, Q = wav_I(t_new), wav_Q(t_new)
-    # cosPulse1 = ((wn.cosPulse(halfpi) << (shift+halfpi/2)))
-    # wav_I1, wav_Q1 = wn.mixing(cosPulse1,phase=2*np.pi*fdetune*delay,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
-    # cosPulse2 = ((wn.cosPulse(halfpi) << (delay+shift+halfpi/2*3)))
-    # wav_I2, wav_Q2 = wn.mixing(cosPulse2,phase=0.0,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
-    # wav_I, wav_Q = wav_I1 + wav_I2, wav_Q1 + wav_Q2
-    # I, Q = wav_I(t_new), wav_Q(t_new)
+    
+    cosPulse1 = ((wn.cosPulse(halfpi) << (shift+halfpi/2)))
+    wav_I1, wav_Q1 = wn.mixing(cosPulse1,phase=2*np.pi*fdetune*delay,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
+    cosPulse2 = ((wn.cosPulse(halfpi) << (delay+shift+halfpi/2*3)))
+    wav_I2, wav_Q2 = wn.mixing(cosPulse2,phase=0.0,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
+    wav_I, wav_Q = wav_I1 + wav_I2, wav_Q1 + wav_Q2
+    I, Q = wav_I(t_new), wav_Q(t_new)
 
     await awg.update_waveform(I, name = name[0])
     await awg.update_waveform(Q, name = name[1])
@@ -309,7 +329,7 @@ async def ac_stark_sequence(measure,awg,kind,pilen,t_rabi):
 ### ZPulse波形
 ################################################################################
 
-async def zWave(measure,awg,name,ch,volt,during=500e-9,shift=1000e-9):
+async def zWave(awg,name,ch,volt,during=500e-9,shift=1000e-9):
 
     await awg.stop()
     wav = (((Step(0e-9) << during) - Step(0e-9)) << shift) * volt
