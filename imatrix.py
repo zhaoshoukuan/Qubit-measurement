@@ -46,12 +46,15 @@ Clifford = {'1':I,
            '23':Yhalf*Xnhalf,
            '24':Yhalf*Xhalf}
 
-def cliffordGroup_single(m):
+def cliffordGroup_single(m,gate):
     
     if m == 0:
-        return []
+        return [gate]
     mseq = np.random.randint(low=1,high=24,size=m)
-    mseq = [str(mseq[i]) for i in range(len(mseq))]
+    if gate:
+        mseq = [str(mseq[i//2]) if i%2==0 else gate for i in range(2*len(mseq))]
+    else:
+        mseq = [str(mseq[i]) for i in range(len(mseq))]
     invertelement = np.mat([[1,0],[0,1]])
     for i in mseq[::-1]:
         invertelement = np.dot(invertelement,Clifford[i])
