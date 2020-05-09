@@ -105,6 +105,15 @@ async def couldRun(awg):
         if x == 1 or 2:
             break
 
+async def clearSeq(measure,awg):
+    for i in awg:
+        await measure.awg[i].stop()
+        await measure.awg[i].write('*WAI')
+        for j in range(8):
+            await measure.awg[i].output_off(ch=j+1)
+        await measure.awg[i].clear_sequence_list()
+    measure.wave = {}
+
 ################################################################################
 # awg载入sequence
 ################################################################################
@@ -135,6 +144,9 @@ async def genwaveform(measure,awg,wavname,ch):
 ################################################################################
 
 async def genSeq(measure,awg,kind):
+    # length = await awg.query('SLISt:SEQuence:LENGth? "%s"'%kind)
+    # if length > len(measure.wave[kind][0])+1:
+    #     await awg.remove_sequence(kind)
     await awg.create_sequence(kind,len(measure.wave[kind][0])+1,8)
     for j,i in enumerate(measure.wave[kind],start=1):
          await awg.set_seq(i,1,j,seq_name=kind)
@@ -143,16 +155,14 @@ async def genSeq(measure,awg,kind):
 # 生成读出Sequence
 ################################################################################
 
-async def readSeq(measure,awg,kind):
+async def readSeq(measure,awg,kind,ch):
+    # length = await awg.query('SLISt:SEQuence:LENGth? "%s"'%kind)
+    # if length > len(measure.wave[kind][0])+1:
+    #     await awg.remove_sequence(kind)
     await awg.create_sequence(kind,len(measure.wave[kind][0])+1,8)
     for j,i in enumerate(measure.wave[kind],start=1):
          await awg.set_seq(i,1,j,seq_name=kind)
-    await measure.awg['awgread'].use_sequence(kind,channels=[7,8])
-    await measure.awg['awgread'].write('*WAI')
-    await measure.awg['awgread'].output_on(ch=7)
-    await measure.awg['awgread'].output_on(ch=8)
-    await measure.awg['awgread'].run()
-    await measure.awg['awgread'].query('*OPC?')
+    await awgchmanage(awg,kind,ch)
 
 ################################################################################
 # awgDC波形
@@ -173,16 +183,21 @@ async def awgDC(awg,wavname,volt):
 ################################################################################
 
 async def writeWave(awg,name,pulse,norm=False,t=t_new):
-    wav_I, wav_Q, mrk1, mrk2 = pulse
-    I, Q, mrk1, mrk2 = wav_I(t), wav_Q(t), mrk1(t), mrk2(t)
-    # I, Q = pulse
     await awg.stop()
-    if norm:
-        I, Q = I / np.max(np.abs(I)), Q / np.max(np.abs(Q))
-    await awg.update_waveform(I, name = name[0])
-    await awg.update_waveform(Q, name = name[1])
-    await awg.update_marker(name=name[0],mk1=mrk1)
-    await awg.update_marker(name=name[1],mk1=mrk2)
+    if len(pulse) == 4:
+        wav_I, wav_Q, mrk1, mrk2 = pulse
+        I, Q, mrk1, mrk2 = wav_I(t), wav_Q(t), mrk1(t), mrk2(t)
+        # I, Q = pulse
+        if norm:
+            I, Q = I / np.max(np.abs(I)), Q / np.max(np.abs(Q))
+        await awg.update_waveform(I, name = name[0])
+        await awg.update_waveform(Q, name = name[1])
+        await awg.update_marker(name=name[0],mk1=mrk1)
+        await awg.update_marker(name=name[1],mk1=mrk2)
+    if len(pulse) == 1:
+        wave = pulse[0]
+        wave = wave(t)
+        await awg.update_waveform(wave, name = name[0])
     await awg.write('*WAI')
 
 ################################################################################
@@ -270,15 +285,6 @@ async def rabiWave(envelopename='square',nwave=1,amp=1,during=75e-9,shift=200e-9
     wav_I, wav_Q = wn.mixing(pulse,phase=phase,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
 
     return wav_I, wav_Q, mpulse, mpulse
-    # lo2 = Expi(2*np.pi*Delta_lo)
-    # # init1 = (((Step(2e-9)<<2*during) - Step(2e-9))<<shift)*lo2
-    # init1 = ((CosPulse(2*during)<<during) <<shift)*lo2
-    # wav = init1 
-    # wav.set_range(*t_range)
-    # points = wav.generateData(sample_rate)
-    
-    # I, Q = np.real(points), np.imag(points)
-    # return I, Q
 
 async def Rabi_sequence(measure,kind,awg,t_rabi,amp=1,nwave=1,envelopename='cospulse'):
     # t_range, sample_rate = measure.t_range, measure.sample_rate
@@ -401,25 +407,14 @@ async def Ramsey_sequence(measure,kind,awg,t_rabi,halfpi):
 # Z_cross波形
 ################################################################################
 
-async def z_crossWave(awg,volt,during=200e-9, shift=200e-9,name=['q1_z']):
-
-    init = ((Step(2e-9)<<during) - Step(2e-9)) * volt
-    wav = init << shift 
-    wav.set_range(*t_range)
-    points = wav.generateData(sample_rate)
-
-    await awg.update_waveform(points, name[0])
-    
 async def Z_cross_sequence(measure,kind_z,kind_ex,awg_z,awg_ex,v_rabi,halfpi):
     #t_range, sample_rate = measure.t_range, measure.sample_rate
-    await measure.awg[awg_ex].stop()
-    await measure.awg[awg_z].stop()
     for j,i in enumerate(tqdm(v_rabi,desc='Z_cross_sequence')):
         name_ch = [measure.wave[kind_ex][0][j],measure.wave[kind_ex][1][j]]
-        await ramseyWave(measure.awg[awg_ex], delay=300/1e9, halfpi=halfpi/1e9, fdetune=0, name = name_ch)
-        await z_crossWave(measure.awg[awg_z],volt=i,during=200/1e9,shift=(50+halfpi+200)/1e9,name=[measure.wave[kind_z][0][j]])
-    await measure.awg[awg_ex].write('*WAI')
-    await measure.awg[awg_z].write('*WAI')
+        pulse_ex = await coherenceWave(measure.envelopename,300/1e9,halfpi/1e9,0,'PDD')
+        await writeWave(awg_ex,name_ch,pulse_ex)
+        pulse_z = (wn.square(200/1e9) << (50+halfpi+200)/1e9) * i
+        await writeWave(awg_z,np.array(measure.wave[kind_z])[:,j],pulse_z)
 
 ################################################################################
 # Speccrosstalk波形
@@ -427,14 +422,12 @@ async def Z_cross_sequence(measure,kind_z,kind_ex,awg_z,awg_ex,v_rabi,halfpi):
 
 async def Speccrosstalk_sequence(measure,kind_z,kind_ex,awg_z,awg_ex,v_rabi,halfpi):
     #t_range, sample_rate = measure.t_range, measure.sample_rate
-    await awg_ex.stop()
-    await awg_z.stop()
     for j,i in enumerate(tqdm(v_rabi,desc='Speccrosstalk_sequence')):
         name_ch = [measure.wave[kind_ex][0][j],measure.wave[kind_ex][1][j]]
-        await rabiWave(awg_ex,during=halfpi/1e9,shift=(100+200)*1e-9, name = name_ch)
-        await z_crossWave(awg_z,volt=i,during=1100/1e9,shift=(200)/1e9,name=[measure.wave[kind_z][0][j]])
-    await awg_ex.write('*WAI')
-    await awg_z.write('*WAI')
+        pulse_ex = await rabiWave(envelopename=measure.envelopename,during=halfpi/1e9,shift=(100+200)*1e-9,phaseDiff=0,DRAGScaling=None)
+        await writeWave(awg_ex,name_ch,pulse_ex)
+        pulse_z = (wn.square(1100/1e9) << (200)/1e9) * i
+        await writeWave(awg_z,np.array(measure.wave[kind_z])[:,j],pulse_z)
 
 ################################################################################
 # AC-Stark波形
@@ -458,16 +451,10 @@ async def ac_stark_wave(measure,awg):
 
 async def zWave(awg,name,ch,volt,during=500e-9,shift=1000e-9):
 
-    await awg.stop()
-    wav = (((Step(0e-9) << during) - Step(0e-9)) << shift) * volt
-    wav.set_range(*t_range)
-    points = wav.generateData(sample_rate)
-    await awg.update_waveform(points,name=name[0])
-    await awg.use_waveform(name=name[0],ch=ch)
-    await awg.output_on(ch=ch)
-    await awg.write('WAI')
-    await awg.run()
-    await awg.query('*OPC?')
+    pulse = (wn.square(during) << (during/2 + shift)) * volt
+    pulselist = (pulse,) 
+    await writeWave(awg,name,pulselist)
+    return pulse
 
 ################################################################################
 # RB波形
