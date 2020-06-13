@@ -190,6 +190,49 @@ async def awgDC(awg,wavname,volt):
     await awg.update_waveform(points,wavname)
 
 ################################################################################
+# Z波形矫正
+################################################################################
+
+def predistort(waveform, sRate, zCali):
+    """Predistort input waveform.
+    Parameters
+    ----------
+        waveform : complex numpy array
+            Waveform data to be pre-distorted
+        zCali: [2.55e-9, -28e-3, 8.02e-9, -28e-3, 101.5e-9, -14.5e-3,369.7e-9,-6.2e-3]
+    Returns
+    -------
+    waveform : complex numpy array
+        Pre-distorted waveform
+    """
+    dt = 1 / sRate
+    wf_size = len(waveform)
+    tau1, A1, tau2, A2, tau3, A3, tau4, A4, tau5, A5 = zCali
+    # print('tau:', tau1, A1, tau2, A2, tau3, A3, tau4, A4, tau5, A5)
+    # pad with zeros at end to make sure response has time to go to zero
+    # pad_time = 6 * max([tau1, tau2, tau3])
+    pad_time = 4e-6  # 这里默认改为增加4us的pad，返回时舍去1us，保留3us拖尾
+    pad_size = round(pad_time / dt)
+    pad_size_2 = round(3e-6 / dt)  # 保留的点数
+    padded_zero = np.zeros(pad_size)
+    padded = np.append(waveform,padded_zero)
+
+    Y = np.fft.rfft(padded, norm='ortho')
+
+    omega = 2 * np.pi * np.fft.rfftfreq(wf_size+pad_size, dt)
+    H = (1 + (1j * A1 * omega * tau1) / (1j * omega * tau1 + 1) +
+         (1j * A2 * omega * tau2) / (1j * omega * tau2 + 1) +
+         (1j * A3 * omega * tau3) / (1j * omega * tau3 + 1) +
+         (1j * A4 * omega * tau4) / (1j * omega * tau4 + 1)+
+         (1j * A5 * omega * tau5) / (1j * omega * tau5 + 1))
+
+    Yc = Y / H
+    yc = np.fft.irfft(Yc, norm='ortho')
+    # return yc[:wf_size]
+    #这里返回增加了3us拖尾的序列
+    return yc[:(wf_size+pad_size_2)]
+
+################################################################################
 # 更新波形
 ################################################################################
 
@@ -209,6 +252,7 @@ async def writeWave(awg,name,pulse,norm=False,t=t_new,mark=False):
     if len(pulse) == 1:
         wave = pulse[0]
         wave = wave(t)
+        # wave = predistort(wave[:-3000],2.5e9,[2.55e-9, -28e-3, 8.02e-9, -28e-3, 101.5e-9, -14.5e-3,369.7e-9,-6.2e-3,5e-9,-5e-3])
         await awg.update_waveform(wave, name = name[0])
 
 ################################################################################
@@ -262,8 +306,8 @@ async def modulation_read(measure,delta,tdelay=1100,repeats=512,rname=['Readout_
         I, Q = I + wav_I, Q + wav_Q
     pulselist = I, Q, mrkp1, mrkp2
     await writeWave(awg,rname,pulselist,True,mark=True)
-    await awg.setValue('Vpp',1.5*n,ch=7)
-    await awg.setValue('Vpp',1.5*n,ch=8)
+    await awg.setValue('Vpp',1*n,ch=7)
+    await awg.setValue('Vpp',1*n,ch=8)
     await awg.write('*WAI')
     await ats_setup(ats,delta,l=tdelay,repeats=repeats)
     await couldRun(awg)
@@ -273,11 +317,11 @@ async def modulation_read(measure,delta,tdelay=1100,repeats=512,rname=['Readout_
 # 激励混频
 ################################################################################
 
-async def modulation_ex(qubit,measure,w=25000e-9,delta_ex=[0]):
+async def modulation_ex(qubit,measure,w=20000e-9,delta_ex=[0],shift=0):
     t_list, awg = measure.t_list, measure.awg['awg132']
     wf, qname, n = WF(t_list), ['awg132_ch7','awg132_ch8'], len(delta_ex)
     await genwaveform(measure,awg,qname,[7,8])
-    pulse = wn.square(w) << (w / 2 + 300e-9)
+    pulse = wn.square(w) << (w / 2 + 500e-9+shift)
     await writeWave(awg,qname,(pulse,pulse,pulse,pulse),mark=True)
     await couldRun(awg)
 
@@ -309,7 +353,7 @@ async def Rabi_sequence(measure,kind,awg,t_rabi,amp=1,nwave=1,delta_lo=220e6,env
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
         pulse = await rabiWave(envelopename=envelopename,nwave=nwave,amp=amp,during=i/1e9,\
             Delta_lo=delta_lo,phase=0,phaseDiff=0,DRAGScaling=None)
-        await writeWave(awg,name_ch,pulse)
+        await writeWave(awg,name_ch,pulse,mark=False)
 
 async def Rabipower_sequence(measure,kind,awg,t_rabi,amp=1,nwave=1,delta_lo=220e6,envelopename='cospulse'):
     # t_range, sample_rate = measure.t_range, measure.sample_rate
@@ -325,15 +369,15 @@ async def Rabipower_sequence(measure,kind,awg,t_rabi,amp=1,nwave=1,delta_lo=220e
 # pipulseDetune波形
 ################################################################################
 
-async def pipulseDetunewave(measure,awg,pilen,n,alpha,delta,name_ch):
+async def pipulseDetunewave(measure,awg,pilen,n,alpha,delta,name_ch,phaseDiff=0):
     shift = 200/1e9
     pilen = pilen / 1e9
     envelope = whichEnvelope(measure.envelopename)
     I, Q, mrk1, mrk2 = wn.zero(), wn.zero(), wn.zero(), wn.zero()
-    for i in [-np.pi,0]*n:
+    for i in [np.pi,0]*n:
         pulse = (envelope(pilen) << (0.5*pilen+shift)) + (envelope(pilen) << (1.5*pilen + shift))
         shift += 2*pilen
-        wav_I, wav_Q = wn.mixing(pulse,phase=i,freq=delta,ratioIQ=-1,DRAGScaling=alpha)
+        wav_I, wav_Q = wn.mixing(pulse,phase=i,freq=delta,phaseDiff=phaseDiff,ratioIQ=-1.0,DRAGScaling=alpha)
         I, Q = I+wav_I, Q+wav_Q
     await writeWave(awg,name_ch,(I,Q,mrk1,mrk2))
     return I,Q,mrk1,mrk2
@@ -393,10 +437,10 @@ async def ramseyWave(delay,halfpi=75e-9,fdetune=3e6, shift=200e-9, Delta_lo=220e
     
     envelope = whichEnvelope(envelopename)
     cosPulse1 = ((envelope(halfpi) << (shift+halfpi/2)))
-    wav_I1, wav_Q1 = wn.mixing(cosPulse1,phase=2*np.pi*fdetune*delay,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
+    wav_I1, wav_Q1 = wn.mixing(cosPulse1,phase=2*np.pi*fdetune*delay,freq=Delta_lo,ratioIQ=1.0,phaseDiff=0.0,DRAGScaling=None)
     
     cosPulse2 = ((envelope(halfpi) << (delay+shift+halfpi/2*3)))
-    wav_I2, wav_Q2 = wn.mixing(cosPulse2,phase=0.0,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
+    wav_I2, wav_Q2 = wn.mixing(cosPulse2,phase=0.0,freq=Delta_lo,ratioIQ=1.0,phaseDiff=0.0,DRAGScaling=None)
     wav_I, wav_Q = wav_I1 + wav_I2, wav_Q1 + wav_Q2
     
     init1 = wn.square(halfpi) << (shift+halfpi/2)
@@ -459,12 +503,13 @@ async def Speccrosstalk_sequence(measure,kind_z,kind_ex,awg_z,awg_ex,v_rabi,half
 # AC-Stark波形
 ################################################################################
 
-async def ac_stark_wave(measure,awg):
+async def ac_stark_wave(measure):
+    awg = measure.awg['awgread']
     pulse_read = await modulation_read(measure,measure.delta,tdelay=measure.readlen)
     width = 500e-9
     pulse = wn.square(width) << (width/2+3000e-9)
     I, Q = wn.zero(), wn.zero()
-    for i in np.array([50e6]):
+    for i in measure.delta:
         wav_I, wav_Q = wn.mixing(pulse,phase=0.0,freq=i,ratioIQ=-1.0)
         I, Q = I + wav_I, Q + wav_Q
     pulse_acstark = (I,Q,wn.zero(),wn.zero())
@@ -480,7 +525,7 @@ async def zWave(awg,name,ch,volt=0.4,during=500e-9,shift=1000e-9,offset=0):
     pulse = (wn.square(during) << (during/2 + shift)) * volt + offset
     pulselist = (pulse,) 
     await writeWave(awg,name,pulselist)
-    return pulse
+    return pulselist
 
 ################################################################################
 # RB波形
@@ -564,25 +609,33 @@ async def rb_sequence(measure,awg,kind,m,gate,pilen):
 # 单比特tomo波形
 ################################################################################
 
-async def tomoWave(envelopename='square',during=0,shift=0,Delta_lo=220e6,axis='X',DRAGScaling=None):
+async def tomoWave(envelopename='square',during=0,shift=0,Delta_lo=220e6,axis='X',DRAGScaling=None,phaseDiff=0):
     shift += 200e-9
     envelope = whichEnvelope(envelopename)
+    if axis == 'X':
+        phi = 0
+        pulse = (((envelope(during) << (shift+during/2))) + ((envelope(during) << (shift+during/2*3))))
+        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Xhalf':
         phi = 0
         pulse = envelope(during) << (shift+during/2)
-        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=DRAGScaling)
+        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Xnhalf':
         phi = np.pi
         pulse = envelope(during) << (shift+during/2)
-        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=DRAGScaling)
+        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
+    if axis == 'Y':
+        phi = np.pi/2
+        pulse = (((envelope(during) << (shift+during/2))) + ((envelope(during) << (shift+during/2*3))))
+        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Ynhalf':
         phi = -np.pi/2
         pulse = envelope(during) << (shift+during/2)
-        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=DRAGScaling)
+        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Yhalf':
         phi = np.pi/2
         pulse = envelope(during) << (shift+during/2)
-        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=DRAGScaling)
+        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=Delta_lo,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Z':
         wav_I, wav_Q = wn.zero(), wn.zero()
     return wav_I, wav_Q, wn.zero(), wn.zero()
@@ -595,7 +648,8 @@ async def tomoTest(measure,awg,t,halfpi,axis,name,DRAGScaling):
     gatepulse = await rabiWave(measure.envelopename,during=t/1e9,shift=(halfpi)/1e9,\
         Delta_lo=220e6,DRAGScaling=DRAGScaling)
     # gatepulse = await rabiWave(envelopename=measure.envelopename,during=halfpi/1e9)
-    tomopulse = await tomoWave(measure.envelopename,halfpi/1e9,Delta_lo=220e6,axis=axis,DRAGScaling=DRAGScaling)
+    tomopulse = await tomoWave(measure.envelopename,halfpi/1e9,\
+        Delta_lo=220e6,axis=axis,DRAGScaling=DRAGScaling)
     pulse = np.array(gatepulse) + np.array(tomopulse)
     await writeWave(awg,name,pulse)
 
@@ -603,9 +657,24 @@ async def tomoTest(measure,awg,t,halfpi,axis,name,DRAGScaling):
 # ramseyZpulse波形
 ################################################################################
 
-async def ramseyZwave(measure,awg,halfpi,axis,name,DRAGScaling):
-    t_int = 500e-9
-    gatepulse = await tomoWave(measure.envelopename,halfpi/1e9,shift=(2*t_int+3*halfpi/1e9),\
+async def ramseyZwave(measure,awg,halfpi,axis,name,DRAGScaling,shift):
+    t_int = 100e-9
+    gatepulse = await tomoWave(measure.envelopename,halfpi/1e9,shift=(t_int+(shift+halfpi)/1e9),\
+        Delta_lo=220e6,axis='Xhalf',DRAGScaling=DRAGScaling)
+    # pulsespinecho = await rabiWave(measure.envelopename,during=halfpi/1e9,shift=(t_int+halfpi/1e9),\
+    #     phase=-np.pi/2,Delta_lo=220e6,DRAGScaling=DRAGScaling)
+    tomopulse = await tomoWave(measure.envelopename,halfpi/1e9,shift=shift/1e9,\
+        Delta_lo=220e6,axis=axis,DRAGScaling=DRAGScaling)
+    pulse = np.array(gatepulse) + np.array(tomopulse)
+    await writeWave(awg,name,pulse)
+
+################################################################################
+# ramseyZpulse_chen波形
+################################################################################
+
+async def ramseyZwave_chen(measure,awg,halfpi,axis,shift,name,DRAGScaling):
+    t_int = 700e-9
+    gatepulse = await tomoWave(measure.envelopename,halfpi/1e9,shift=(t_int+shift+halfpi/1e9),\
         Delta_lo=220e6,axis='Xhalf',DRAGScaling=DRAGScaling)
     # pulsespinecho = await rabiWave(measure.envelopename,during=halfpi/1e9,shift=(t_int+halfpi/1e9),\
     #     phase=-np.pi/2,Delta_lo=220e6,DRAGScaling=DRAGScaling)
@@ -618,11 +687,29 @@ async def ramseyZwave(measure,awg,halfpi,axis,name,DRAGScaling):
 ################################################################################
 
 async def dragDetunewave(measure,awg,pilen,coef,axis,name_ch):
-    pulse1 = await rabiWave(measure.envelopename,during=pilen/1e9,shift=pilen/1e9,phase=axis[0],Delta_lo=220e6,DRAGScaling=coef)
+    pulse1 = await tomoWave(measure.envelopename,during=pilen/1e9,Delta_lo=220e6,axis=axis[0],DRAGScaling=coef)
     pulse2 = await tomoWave(measure.envelopename,during=pilen/1e9,Delta_lo=220e6,axis=axis[1],DRAGScaling=coef)
     pulse = np.array(pulse1) + np.array(pulse2)
     await writeWave(awg,name_ch,pulse)
     
+################################################################################
+# dragcoefHD
+################################################################################
+
+async def HDWave(measure,awg,pilen,coef,axis,nwave,name_ch):
+    pulseequator2 = await tomoWave(measure.envelopename,during=pilen/1e9,Delta_lo=220e6,axis='Xhalf',DRAGScaling=coef,phaseDiff=0)
+    pulsem, shift = np.array([wn.zero()]*4), 0
+    for i in range(nwave):
+        shift += pilen/1e9 +10e-9
+        pulse1 = await tomoWave(measure.envelopename,during=pilen/1e9,shift=shift,Delta_lo=220e6,axis=axis[0],DRAGScaling=coef,phaseDiff=0)
+        shift += pilen/1e9 + 10e-9
+        pulse2 = await tomoWave(measure.envelopename,during=pilen/1e9,shift=shift,Delta_lo=220e6,axis=axis[1],DRAGScaling=coef,phaseDiff=0)
+        pulsem += (np.array(pulse1)+np.array(pulse2))
+    pulseequator1 = await tomoWave(measure.envelopename,during=pilen/1e9,shift=(shift+pilen/1e9+10e-9),\
+        Delta_lo=220e6,axis='Xhalf',DRAGScaling=coef,phaseDiff=0)
+    pulse = np.array(pulseequator1) + np.array(pulseequator2) + np.array(pulsem)
+    await writeWave(awg,name_ch,pulse)
+
 ################################################################################
 # RTO
 ################################################################################
