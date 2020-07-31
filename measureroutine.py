@@ -219,16 +219,35 @@ async def rabitest(measure,t_rabi,comwave,amp=1,nwave=1,exstate={}):
     len_data, t = len(t_rabi), np.array([t_rabi]*measure.n).T
     delta_ex, current = await exManage(measure,exstate=exstate)
     bit = measure.qubits
+#     for i in delta_ex:
+#         qubit = bit[i]
+#         name = ''.join((qubit.inst['ex_awg'],qubit.q_name,'rabi'))
+#         awg = measure.awg[qubit.inst['ex_awg']]
+#         await cw.create_wavelist(measure,name,(awg,['I','Q'],len(t_rabi),len(measure.t_list)))
+#         await cw.genSeq(measure,awg,name)
+#         if comwave:
+#             await cw.Rabi_sequence(measure,name,awg,t_rabi,amp,nwave,delta_lo=delta_ex[i])
+#         await cw.awgchmanage(awg,name,qubit.inst['ex_ch'])
+# 并行计算取代以上注释部分
+    task1, task2 = [], []
     for i in delta_ex:
         qubit = bit[i]
         name = ''.join((qubit.inst['ex_awg'],qubit.q_name,'rabi'))
         awg = measure.awg[qubit.inst['ex_awg']]
+        namelist.append(name)
+        awglist.append(awg)
         await cw.create_wavelist(measure,name,(awg,['I','Q'],len(t_rabi),len(measure.t_list)))
         await cw.genSeq(measure,awg,name)
         if comwave:
-            await cw.Rabi_sequence(measure,name,awg,t_rabi,amp,nwave,delta_lo=delta_ex[i])
-
-        await cw.awgchmanage(awg,name,qubit.inst['ex_ch'])
+            task_ready = cw.Rabi_sequence(measure,name,awg,t_rabi,amp,nwave,delta_lo=delta_ex[i])
+            task.append(task_ready)
+        task_manageawg = cw.awgchmanage(awg,name,qubit.inst['ex_ch'])
+        task2.append(task_manegeawg)
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(asyncio.wait(task1))
+    loop.run_until_complete(asyncio.wait(task2))
+    loop.close()
+# 中间部分
     measure.wave['Read'] = [['Readout_I']*len(t_rabi),['Readout_Q']*len(t_rabi)]
     await cw.readSeq(measure,measure.awg['awgread'],'Read',[7,8])
 
