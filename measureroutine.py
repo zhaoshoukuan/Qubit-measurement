@@ -11,7 +11,7 @@
 '''
 
 # here put the import lib
-import numpy as np, serial, time
+import numpy as np, serial, time, asyncio
 from qulab.job import Job
 from qulab.wavepoint import WAVE_FORM as WF
 from collections import Iterable
