@@ -17,7 +17,7 @@ from qulab.wavepoint import WAVE_FORM as WF
 from qulab.waveform import CosPulseDrag, Expi, DC, Step, Gaussian, CosPulse
 from qulab import waveform_new as wn
 from tqdm import tqdm_notebook as tqdm
-import asyncio
+import asyncio, inspect
 from qulab import imatrix as mx
 
 
@@ -54,6 +54,24 @@ def loadStatus(fname='D:/status.obj'):
     for k, v in status.items():
         globals()[k] = pickle.loads(v)
 
+################################################################################
+# 函数参数解析及赋值
+################################################################################
+
+async def funcarg(f,config,**kws):
+    # cp = ConfigParser()
+    # config.read(r'D:\QuLabData\config\status.ini')
+    section = f.__name__
+    insp = inspect.getfullargspec(f)
+    paras, defaults = insp[0], insp[3]
+    status = {}
+    for i in paras:
+        if i in config:
+            status[i] = eval(config.get(section,i))
+        else:
+            status[i] = kws[i]
+    await f(**status)
+    
 ################################################################################
 # 收集awg波形名字
 ################################################################################
@@ -148,9 +166,10 @@ async def genSeq(measure,awg,kind):
     # length = await awg.query('SLISt:SEQuence:LENGth? "%s"'%kind)
     # if length > len(measure.wave[kind][0])+1:
     #     await awg.remove_sequence(kind)
+    wait = 'ITR' if awg == measure.awg['awg_trig'] else 'ATR'
     await awg.create_sequence(kind,len(measure.wave[kind][0])+1,8)
     for j,i in enumerate(measure.wave[kind],start=1):
-         await awg.set_seq(i,1,j,seq_name=kind)
+         await awg.set_seq(i,1,j,seq_name=kind,wait=wait)
 
 ################################################################################
 # 生成读出Sequence
@@ -160,9 +179,10 @@ async def readSeq(measure,awg,kind,ch):
     # length = await awg.query('SLISt:SEQuence:LENGth? "%s"'%kind)
     # if length > len(measure.wave[kind][0])+1:
     #     await awg.remove_sequence(kind)
+    wait = 'ITR' if awg == measure.awg['awg_trig'] else 'ATR'
     await awg.create_sequence(kind,len(measure.wave[kind][0])+1,8)
     for j,i in enumerate(measure.wave[kind],start=1):
-         await awg.set_seq(i,1,j,seq_name=kind)
+         await awg.set_seq(i,1,j,seq_name=kind,wait=wait)
     await awgchmanage(awg,kind,ch)
 
 ################################################################################
@@ -268,7 +288,7 @@ async def writeWave(awg,name,pulse,norm=False,t=t_new,mark=False):
 ################################################################################
 
 def whichEnvelope(envelop):
-    x = {'square':wn.square,'cospulse':wn.cosPulse,'gaussian':wn.gaussian}
+    x = {'square':wn.square,'hanning':wn.hanning,'hamming':wn.hamming,'gaussian':wn.gaussian}
     return x[envelop]
 
 ################################################################################
@@ -308,14 +328,14 @@ async def modulation_read(measure,delta,tdelay=1100,repeats=512,phase=0.0,amp=0.
     pulse = amp*pulse1+pulse2
 
     mrkp1 = wn.square(25000e-9) << (25000e-9 / 2 + 300e-9)
-    mrkp2 = wn.square(wavelen/1e9) >> (wavelen / 1e9 / 2 + 430 / 1e9 + ringup / 1e9)
-    mrkp3 = wn.square(4000/1e9) >> 1000/1e9
-    mrkp4 = wn.square(80000/1e9) << 39000/1e9
+    mrkp2 = wn.square(wavelen/1e9) >> (wavelen / 1e9 / 2 + 440 / 1e9 + ringup / 1e9)
+    # mrkp3 = wn.square(4000/1e9) >> 1000/1e9
+    mrkp4 = wn.square(5000/1e9) << (2500+84995)/1e9
     I, Q = wn.zero(), wn.zero()
     for i in delta:
         wav_I, wav_Q = wn.mixing(pulse,phase=phase,freq=i,ratioIQ=-1.0)
         I, Q = I + wav_I, Q + wav_Q
-    pulselist = I, Q, (mrkp1,mrkp3), (mrkp2,mrkp4)
+    pulselist = I, Q, (mrkp2,), (mrkp4,mrkp4,mrkp1,mrkp4)
     await writeWave(awg,rname,pulselist,True,mark=True)
     await awg.setValue('Vpp',1.5*n,ch=1)
     await awg.setValue('Vpp',1.5*n,ch=5)
@@ -340,11 +360,13 @@ async def modulation_ex(qubit,measure,w=20000e-9,delta_ex=[0],shift=0):
 # Rabi波形
 ################################################################################
 
-async def rabiWave(envelopename='square',nwave=1,amp=1,during=75e-9,shift=0,Delta_lo=110e6,phase=0,phaseDiff=0,DRAGScaling=None):
+async def rabiWave(envelopename='square',nwave=1,amp=1,during=75e-9,shift=0,Delta_lo=110e6,phase=0,phaseDiff=0,DRAGScaling=None,single=False):
     shift += 200e-9
     envelope = whichEnvelope(envelopename)
-    wave = (((envelope(during) << (shift+during/2))) + ((envelope(during) << (shift+during/2*3)))) * amp
-    # wave = ((wn.cosPulse(2*during) << (shift+during)))
+    if single:
+        wave = ((envelope(2*during) << (shift+during))) *amp
+    else:
+        wave = (((envelope(during) << (shift+during/2))) + ((envelope(during) << (shift+during/2*3)))) * amp
     
     # mwav = (wn.square(2*during+380e-9) << (during+190e-9+10e-9)) * amp
     mwav = wn.square(2*during) << (during+shift)
@@ -356,7 +378,7 @@ async def rabiWave(envelopename='square',nwave=1,amp=1,during=75e-9,shift=0,Delt
 
     return wav_I, wav_Q, mpulse, mpulse
 
-async def Rabi_sequence(measure,kind,awg,t_rabi,amp=1,nwave=1,delta_lo=110e6,envelopename='cospulse'):
+async def Rabi_sequence(measure,kind,awg,t_rabi,amp=1,nwave=1,delta_lo=110e6,envelopename='hanning'):
     # t_range, sample_rate = measure.t_range, measure.sample_rate
     measure.envelopename, measure.amp = envelopename, amp
     await awg.stop()
@@ -366,14 +388,14 @@ async def Rabi_sequence(measure,kind,awg,t_rabi,amp=1,nwave=1,delta_lo=110e6,env
             Delta_lo=delta_lo,phase=0,phaseDiff=0,DRAGScaling=None)
         await writeWave(awg,name_ch,pulse,mark=False)
 
-async def Rabipower_sequence(measure,kind,awg,t_rabi,amp=1,nwave=1,delta_lo=110e6,envelopename='cospulse'):
+async def Rabipower_sequence(measure,kind,awg,t_rabi,amp=1,nwave=1,delta_lo=110e6,envelopename='hanning'):
     # t_range, sample_rate = measure.t_range, measure.sample_rate
     measure.envelopename = envelopename
     await awg.stop()
     for j,i in enumerate(tqdm(amp,desc=''.join(('Rabipower_',kind)))):
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
         pulse = await rabiWave(envelopename=envelopename,nwave=nwave,amp=i,during=t_rabi/1e9,\
-            Delta_lo=delta_lo,phase=0,phaseDiff=0,DRAGScaling=None)
+            Delta_lo=delta_lo,phase=0,phaseDiff=0,DRAGScaling=None,single=True)
         await writeWave(awg,name_ch,pulse)
 
 ################################################################################
