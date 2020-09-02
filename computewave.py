@@ -287,8 +287,16 @@ async def writeWave(awg,name,pulse,norm=False,t=t_new,mark=False):
 # 波包选择
 ################################################################################
 
-def whichEnvelope(envelop):
-    x = {'square':wn.square,'hanning':wn.hanning,'hamming':wn.hamming,'gaussian':wn.gaussian}
+def whichEnvelope(envelop,during):
+    hanning1 = wn.hanning(during) << during/2
+    hanning2 = (wn.hanning(during) << during/2) + (wn.hanning(during) << 1.5*during)
+    hamming1 = wn.hamming(during) << during/2
+    hamming2 = (wn.hamming(during) << during/2) + (wn.hamming(during) << 1.5*during)
+    gaussian1 = wn.gaussian(during) << during/2
+    gaussian2 = (wn.gaussian(during) << during/2) + (wn.gaussian(during) << 1.5*during)
+    square = wn.square(during) << during/2
+    x = {'square':square,'hanning1':hanning1,'hanning2':hanning2,'hamming1':hamming1,\
+        'hamming2':hamming2,'gaussian1':gaussian1,'gaussian2':gaussian2}
     return x[envelop]
 
 ################################################################################
