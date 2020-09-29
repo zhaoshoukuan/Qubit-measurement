@@ -2,7 +2,7 @@ import functools
 import profile
 from bisect import bisect_left
 from itertools import product
-
+from scipy import signal
 import numpy as np
 import scipy.special as special
 
@@ -339,7 +339,7 @@ def gaussian(width):
     # std is set to give total pulse area same as a square
     #std_sq2 = width/np.sqrt(np.pi)
     return Waveform(bounds=(-0.5 * width, 0.5 * width, +np.inf),
-                    seq=(_zero, _basic_wave(GAUSSIAN, std_sq2), _zero))
+                    seq=(_zero, _add(_basic_wave(GAUSSIAN, std_sq2),_const(-1/16)), _zero))
 
 
 def cos(w, phi=0):
@@ -356,11 +356,20 @@ def sinc(bw):
                     seq=(_zero, _basic_wave(SINC, bw), _zero))
 
 
-def cosPulse(width):
+def hanning(width):
     # cos = _basic_wave(COS, 2*np.pi/width)
     # pulse = _mul(_add(cos, _one), _half)
     pulse = ((((), ()), (((COS, 0, 6.283185307179586 / width), ), (1, ))),
              (0.5, 0.5))
+    return Waveform(bounds=(-0.5 * width, 0.5 * width, +np.inf),
+                    seq=(_zero, pulse, _zero))
+
+def hamming(width):
+    # cos = _basic_wave(COS, 2*np.pi/width)
+    # pulse = _mul(_add(cos, _one), _half)
+    # 相比于hanning只是加权系数不同
+    pulse = ((((), ()), (((COS, 0, 6.283185307179586 / width), ), (1, ))),
+             (0.54, 0.46))
     return Waveform(bounds=(-0.5 * width, 0.5 * width, +np.inf),
                     seq=(_zero, pulse, _zero))
 
@@ -411,5 +420,5 @@ def mixing(pulse,
 
 __all__ = [
     'Waveform', 'D', 'zero', 'one', 'const', 'step', 'square', 'gaussian',
-    'cos', 'sin', 'cosPulse', 'poly', 'mixing'
+    'cos', 'sin', 'hanning', 'hamming', 'poly', 'mixing'
 ]

@@ -72,7 +72,8 @@ async def funcarg(f,qubit,**kws):
     #         if defaults and j < len(defaults):
     #             ptype = type(defaults[-j-1])
     #             status[i] = bit[i]
-            status[i] = bit[i]
+            if i in bit:
+                status[i] = bit[i]
     # print(status)
     pulse = await f(**status)
     return pulse
@@ -133,6 +134,10 @@ async def couldRun(awg,chlist=None,namelist=None):
         if x == 1 or x == 2:
             break
 
+################################################################################
+# awg清理sequence
+################################################################################
+
 async def clearSeq(measure,awg):
     for i in awg:
         await measure.awg[i].stop()
@@ -149,10 +154,12 @@ async def clearSeq(measure,awg):
 async def awgchmanage(awg,seqname,ch):
     await awg.stop()
     await awg.use_sequence(seqname,channels=ch)
-    await awg.query('*OPC?')
+    time.sleep(5)
+    # await awg.query('*OPC?')
     for i in ch:
         await awg.output_on(ch=i)
     await couldRun(awg)
+    return
     
 ################################################################################
 # awg生成并载入waveform
@@ -172,7 +179,7 @@ async def genwaveform(awg,wavname,ch,t_list=t_list):
 ################################################################################
 
 async def genSeq(measure,awg,kind):
-
+    await awg.stop()
     await awg.create_waveform(name='zero', length=2400, format=None)
     wait = 'ATR' if awg == measure.awg['awg_trig'] else 'ATR'
     await awg.create_sequence(kind,1000,8)
@@ -201,7 +208,7 @@ async def readSeq(measure,awg,kind,ch):
 ################################################################################
 
 async def gen_packSeq(measure,kind,awg,name,steps,readseq=True):
-
+   
     await create_wavelist(measure,kind,(awg,name,steps,len(measure.t_list)))
     await genSeq(measure,awg,kind)
     if readseq:
@@ -352,10 +359,11 @@ async def ats_setup(ats,delta,l=1000,repeats=500,awg=0):
 # 读出混频
 ################################################################################
 
-async def modulation_read(measure,delta,tdelay=1100,repeats=512,phase=0.0,amp=0.3,rname=['Readout_I','Readout_Q']):
+async def modulation_read(measure,delta,readlen=1100,repeats=512,phase=0.0,rname=['Readout_I','Readout_Q']):
     t_list, ats, awg = measure.t_list, measure.ats, measure.awg['awgread']
     await awg.stop()
-    twidth, n, measure.readlen = tdelay, len(delta), tdelay
+    readamp = measure.readamp
+    twidth, n, measure.readlen = readlen, len(delta), readlen
     wavelen = (twidth // 64) * 64
     if wavelen < twidth:
         wavelen += 64
@@ -367,7 +375,7 @@ async def modulation_read(measure,delta,tdelay=1100,repeats=512,phase=0.0,amp=0.
     # pulse1 = wn.square((wavelen-ringup)/1e9) >> ((wavelen+ringup)/ 1e9 / 2)
     pulse1 = wn.square(wavelen/1e9) >> (wavelen/ 1e9 / 2 + ringup / 1e9)
     pulse2 = wn.square(ringup/1e9)>>(ringup/2/1e9)
-    pulse = amp*pulse1+pulse2
+    pulse = readamp*pulse1+pulse2
 
     mrkp1 = wn.square(25000e-9) << (25000e-9 / 2 + 300e-9)
     mrkp2 = wn.square(wavelen/1e9) >> (wavelen / 1e9 / 2 + 440 / 1e9 + ringup / 1e9)
@@ -377,12 +385,13 @@ async def modulation_read(measure,delta,tdelay=1100,repeats=512,phase=0.0,amp=0.
     for i in delta:
         wav_I, wav_Q = wn.mixing(pulse,phase=phase,freq=i,ratioIQ=-1.0)
         I, Q = I + wav_I, Q + wav_Q
+    I, Q = I / n, Q / n
     pulselist = I, Q, (mrkp2,), (mrkp4,mrkp4,mrkp1,mrkp4)
-    await writeWave(awg,rname,pulselist,True,mark=True)
+    await writeWave(awg,rname,pulselist,False,mark=True)
     await awg.setValue('Vpp',1.5*n,ch=1)
     await awg.setValue('Vpp',1.5*n,ch=5)
     await awg.write('*WAI')
-    await ats_setup(ats,delta,l=tdelay,repeats=repeats)
+    await ats_setup(ats,delta,l=readlen,repeats=repeats)
     await couldRun(awg)
     return pulselist
 
@@ -410,8 +419,8 @@ async def rabiWave(envelopename=['square',1],nwave=1,amp=1,pi_len=75e-9,shift=0,
     mwav = wn.square(2*pi_len) << (pi_len+shift)
     pulse, mpulse = wn.zero(), wn.zero()
     for i in range(nwave):
-        pulse += (wave << 2*i*pi_len)
-        mpulse += (mwav << 2*i*pi_len)
+        pulse += (wave << envelopename[1]*i*pi_len)
+        mpulse += (mwav << envelopename[1]*i*pi_len)
     wav_I, wav_Q = wn.mixing(pulse,phase=phase,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
 
     return wav_I, wav_Q, mpulse, mpulse
@@ -426,6 +435,18 @@ async def Rabi_sequence(qubit,measure,kind,t_rabi):
     for j,i in enumerate(tqdm(t_rabi,desc=''.join(('Rabi_',kind)))):
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
         pulse = await funcarg(rabiWave,qubit,pi_len=i/1e9)
+        await writeWave(awg,name_ch,pulse,mark=False)
+
+################################################################################s
+# RabiPower_seq
+################################################################################
+
+async def RabiPower_sequence(qubit,measure,kind,amp):
+    awg= measure.awg[qubit.inst['ex_awg']]
+    await awg.stop()
+    for j,i in enumerate(tqdm(amp,desc=''.join(('RabiPower_',kind)))):
+        name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
+        pulse = await funcarg(rabiWave,qubit,amp=i)
         await writeWave(awg,name_ch,pulse,mark=False)
 
 ################################################################################s
@@ -555,7 +576,7 @@ async def Speccrosstalk_sequence(measure,qubit,kind_z,kind_ex,v_rabi,halfpi):
 
 async def ac_stark_wave(measure):
     awg = measure.awg['awgread']
-    pulse_read = await modulation_read(measure,measure.delta,tdelay=measure.readlen)
+    pulse_read = await modulation_read(measure,measure.delta,readlen=measure.readlen)
     width = 500e-9
     pulse = (wn.square(width) << (width/2+3000e-9)) * 1
     I, Q = wn.zero(), wn.zero()
@@ -592,114 +613,38 @@ async def Z_sequence(measure,qubit,kind,t_rabi,volt):
         # await writeWave(z_awg,name_ch,pulse)
 
 ################################################################################
-# RB波形
-################################################################################
-
-def genXY(pi_len,shift=0e-9,tdelay=0e-9,pulse='pi',envelopename='square'):
-    shift += 200e-9
-    envelope = whichEnvelope(envelopename)
-    if pulse == 'halfpi':
-        pulse = envelope(pi_len) << (shift+pi_len/2)
-    if pulse == 'pi':
-        pulse = (envelope(pi_len) << (shift+pi_len/2)) + (envelope(pi_len) << (shift+pi_len/2*3))
-    
-    return pulse
-
-def genParas(x):
-    if x == 'I':
-        paras = (0,'pi')
-    elif x == 'X':
-        paras = (0,'pi')
-    elif x == 'Xhalf':
-        paras = (0,'halfpi')
-    elif x == 'Xnhalf':
-        paras = (np.pi,'halfpi')
-    elif x == 'Y':
-        paras = (np.pi/2,'pi')
-    elif x == 'Yhalf':
-        paras = (np.pi/2,'halfpi')
-    elif x == 'Ynhalf':
-        paras = (3*np.pi/2,'halfpi')
-    return paras
-
-async def rbWave(measure,m,gate,pilen,delta_ex=110e6,shift=0,phaseDiff=0.0,DRAGScaling=None):
-    op = {'1':['I'],'2':['X'],'3':['Xhalf'],'4':['Xnhalf'],'5':['Y'],'6':['Yhalf'],'7':['Ynhalf'],
-        '8':['X','Y'],'9':['Xhalf','Yhalf','Xnhalf'],'10':['Xhalf','Ynhalf','Xnhalf'],'11':['Ynhalf','X'],
-        '12':['Yhalf','X'],'13':['Xhalf','Y'],'14':['Xnhalf','Y'],'15':['Xhalf','Yhalf','Xhalf'],'16':['Xnhalf','Yhalf','Xnhalf'],
-        '17':['Xhalf','Yhalf'],'18':['Xnhalf','Yhalf'],'19':['Xhalf','Ynhalf'],'20':['Xnhalf','Ynhalf'],
-        '21':['Ynhalf','Xnhalf'],'22':['Ynhalf','Xhalf'],'23':['Yhalf','Xnhalf'],'24':['Yhalf','Xhalf']}
-
-    mseq = mx.cliffordGroup_single(m,gate)
-    if mseq == []:
-        return
-    rotseq = []
-    for i in mseq[::-1]:
-        rotseq += op[i]
-    waveseq_I, waveseq_Q, wav = wn.zero(), wn.zero(), wn.zero()
-    # rotseq = ['Xhalf','Xnhalf','Yhalf','Ynhalf']*m
-    # if rotseq == []:
-    #     return
-    # print(rotseq)
-    for i in rotseq:
-        paras = genParas(i)
-        if i == 'I':
-            waveseq_I += wn.zero()
-            waveseq_Q += wn.zero()
-            # continue
-        else:
-            pulse = genXY(pi_len=pilen,pulse=paras[1],envelopename=measure.envelopename)
-            cosPulse = pulse << shift
-            phi = paras[0]
-            wav_I, wav_Q = wn.mixing(cosPulse,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
-            waveseq_I += wav_I
-            waveseq_Q += wav_Q
-            
-        if paras[1] == 'pi':
-            shift += 2*pilen
-        if paras[1] == 'halfpi':
-            shift += pilen
-
-    return waveseq_I, waveseq_Q, wn.zero(), wn.zero()
-    
-async def rb_sequence(measure,awg,kind,m,gate,pilen):
-    await awg.stop()
-    for j,i in enumerate(tqdm(range(len(measure.wave[kind][0])),desc='RB_sequence')):
-        name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
-        pulse = await rbWave(measure,m,gate,pilen*1e-9)
-        await writeWave(awg,name_ch,pulse)
-    await awg.query('*OPC?')
-
-################################################################################
 # 单比特tomo波形
 ################################################################################
 
-async def tomoWave(envelopename='square',pi_len=0,shift=0,delta_ex=110e6,axis='X',DRAGScaling=None,phaseDiff=0):
-    shift += 200e-9
-    envelope = whichEnvelope(envelopename)
+async def singleQgate(envelopename=['square',1],pi_len=30e-9,amp=1,shift=0,delta_ex=110e6,axis='X',\
+    DRAGScaling=None,phaseDiff=0,timing={'z>xy':0,'read>xy':0}):
+    
+    shift += timing['read>xy']
+    if envelopename[1] == 1:
+        envelope_pi = whichEnvelope(pi_len,*envelopename) * amp 
+        envelope_half = whichEnvelope(pi_len,*envelopename) * 0.5 * amp 
+    if envelopename[1] == 2:
+        envelope_pi = whichEnvelope(pi_len,*envelopename) * amp 
+        envelope_half = whichEnvelope(pi_len,envelopename[0],1) * amp 
+
     if axis == 'X':
         phi = 0
-        pulse = (((envelope(pi_len) << (shift+pi_len/2))) + ((envelope(pi_len) << (shift+pi_len/2*3))))
-        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
+        wav_I, wav_Q = wn.mixing(envelope_pi,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Xhalf':
         phi = 0
-        pulse = envelope(pi_len) << (shift+pi_len/2)
-        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
+        wav_I, wav_Q = wn.mixing(envelope_half,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Xnhalf':
         phi = np.pi
-        pulse = envelope(pi_len) << (shift+pi_len/2)
-        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
+        wav_I, wav_Q = wn.mixing(envelope_half,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Y':
         phi = np.pi/2
-        pulse = (((envelope(pi_len) << (shift+pi_len/2))) + ((envelope(pi_len) << (shift+pi_len/2*3))))
-        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
+        wav_I, wav_Q = wn.mixing(envelope_pi,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Ynhalf':
         phi = -np.pi/2
-        pulse = envelope(pi_len) << (shift+pi_len/2)
-        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
+        wav_I, wav_Q = wn.mixing(envelope_half,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Yhalf':
         phi = np.pi/2
-        pulse = envelope(pi_len) << (shift+pi_len/2)
-        wav_I, wav_Q = wn.mixing(pulse,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
+        wav_I, wav_Q = wn.mixing(envelope_half,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Z':
         wav_I, wav_Q = wn.zero(), wn.zero()
     return wav_I, wav_Q, wn.zero(), wn.zero()
@@ -787,3 +732,50 @@ async def rtoWave(measure,awg,pilen,name_ch):
     pulse2 = np.array(pulsegate)+np.array(pulsetomox)
     await writeWave(awg,name_ch[0],pulse1)
     await writeWave(awg,name_ch[1],pulse2)
+
+################################################################################
+# RB波形
+################################################################################
+
+async def rbWave(m,gate,envelopename=['square',1],pi_len=30e-9,amp=1,delta_ex=110e6,shift=0,\
+    DRAGScaling=None,phaseDiff=0,timing={'z>xy':0,'read>xy':0}):
+
+    op = mx.op
+
+    mseq = mx.cliffordGroup_single(m,gate)
+    if mseq == []:
+        return
+    rotseq = []
+    for i in mseq[::-1]:
+        rotseq += op[i]
+    waveseq_I, waveseq_Q, wav = wn.zero(), wn.zero(), wn.zero()
+    # rotseq = ['Xhalf','Xnhalf','Yhalf','Ynhalf']*m
+    # if rotseq == []:
+    #     return
+    # print(rotseq)
+    for i in rotseq:
+        # paras = genParas(i)
+        if i == 'I':
+            waveseq_I += wn.zero()
+            waveseq_Q += wn.zero()
+            # continue
+        else:
+            wav_I, wav_Q, mrk1, mrk2 = await singleQgate(envelopename=envelopename,pi_len=pi_len,\
+                amp=amp,shift=shift,delta_ex=delta_ex,axis=i,\
+                DRAGScaling=DRAGScaling,phaseDiff=phaseDiff,timing=timing)
+            waveseq_I += wav_I
+            waveseq_Q += wav_Q
+        if envelopename[1] == 2:
+            if i in ['X','Y','Z']:
+                shift += envelopename[1]*pi_len
+            else:
+                shift += pi_len
+        if envelopename[1] == 1:
+            shift += pi_len
+        # if paras[1] == 'pi':
+        #     shift += envelopename[1]*pi_len
+        # if paras[1] == 'halfpi':
+        #     shift += pi_len
+
+    return waveseq_I, waveseq_Q, wn.zero(), wn.zero()
+    

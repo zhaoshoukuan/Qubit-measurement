@@ -1,7 +1,9 @@
 from qulab.storage import connect
 from qulab.storage.schema import Record, base
 import matplotlib.pyplot as plt
-import numpy as np
+import numpy as np, imp
+import qulab.optimize
+op = imp.reload(qulab.optimize)
 
 connect.connect()
 
@@ -16,7 +18,7 @@ def read(title=None,which=0):
     return data, ID, comment, tags, name, finishtime
 
 
-def write(phase=None,addr='mongodb',height=2,title=None,which=0,peak=110,dB=False):
+def write(phase=None,addr='mongodb',height=2,title=None,which=0,peak=110,dB=False,dePhase=False):
     if addr == 'mongodb':
         data, ID, comment, tags, name, finishtime = read(title=title,which=which)
     else:
@@ -69,6 +71,9 @@ def write(phase=None,addr='mongodb',height=2,title=None,which=0,peak=110,dB=Fals
             v = []
             for i in range(num): 
                 cols, rows, s= data[0][:,i], data[1][0,:,i], data[2][:,:,i]
+                if dePhase :
+                    rows, s = op.RowToRipe().deductPhase(rows,s)
+
                 rows = rows / 1e9 if rows[0] / 1e9 > 1 else rows 
                 cols = cols / 1e9 if cols[0] / 1e9 > 1 else cols 
                 v.append((cols,rows,s))
@@ -93,7 +98,7 @@ def write(phase=None,addr='mongodb',height=2,title=None,which=0,peak=110,dB=Fals
                 cols, rows, s= data[0][:,i], data[1][0,:,i], data[2][:,:,i]
                 rows = rows / 1e9 if rows[0] / 1e9 > 1 else rows 
                 cols = cols / 1e9 if cols[0] / 1e9 > 1 else cols 
-                s[np.abs(s) > peak] = s[np.abs(s)==np.min(np.abs(s))]
+                # s[np.abs(s) > peak] = s[np.abs(s)==np.min(np.abs(s))]
                 v.append((cols,rows,s))
                 extent = [min(rows),max(rows),min(cols),max(cols)]
                 res = 20*np.log10(np.abs(s)) if dB else np.abs(s)
