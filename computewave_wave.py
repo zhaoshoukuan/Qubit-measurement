@@ -19,6 +19,8 @@ from qulab import waveform_new as wn
 from tqdm import tqdm_notebook as tqdm
 import asyncio, inspect
 from qulab import imatrix as mx
+import functools
+# from qulab import measurement_wave as mrw
 
 
 t_list = np.linspace(0,100000,250000)
@@ -100,21 +102,132 @@ def Collect_Waveform(dictname,kind):
 ################################################################################
 
 async def create_wavelist(measure,kind,para):
-    awg,name,n_wave,length = para
+    awg,name,n_wave,length,mode = para
     if kind in measure.wave:
         print('Warning: kind has already existed')
     @Collect_Waveform(measure.wave,kind)
-    async def create_waveformlist(awg,name,n_wave,length):
+    async def create_waveformlist(awg,name,n_wave,length,mode):
         name_list = []
-        for i in name:
+        name_sub_list = []
+        for k, i in enumerate(name):
             name_collect = []
             for j in range(1,n_wave+1):
+                if mode == 'hbroadcast':
+                    if k == 0:
+                        name_sub = ''.join((kind,'_sub','%d'%j))
+                        await awg.create_sequence(name_sub,2,2)
+                        name_sub_list.append(name_sub)
                 name_w = ''.join((kind,'_',i,'%d'%j))
                 name_collect.append(name_w)
                 await awg.create_waveform(name=name_w, length=length, format=None) 
             name_list.append(name_collect)
+        name_list.append(name_sub_list)
         return name_list
     return create_waveformlist(*para)
+
+################################################################################
+# 关闭仪器
+################################################################################
+
+async def close(measure):
+    inst = {**measure.dc , **measure.psg}
+    for i in inst:
+        await inst[i].setValue('Output','OFF')
+
+################################################################################
+# 查询仪器状态
+################################################################################
+
+async def QueryInst(measure):
+    inst = {**measure.dc , **measure.psg, **measure.awg}
+    state = {}
+    for i in inst:
+        try:
+            if 'psg' in i:
+                freq = await inst[i].getValue('Frequency')
+                power = await inst[i].getValue('Power')
+                Output = await inst[i].getValue('Output')
+                Moutput = await inst[i].getValue('Moutput')
+                Mform = await inst[i].getValue('Mform')
+                err = (await inst[i].query('syst:err?')).strip('\n\r').split(',')
+                sm = {'freq':'%fGHz'%(freq/1e9),'power':'%fdBm'%power,'output':Output.strip('\n\r'),\
+                    'moutput':Moutput.strip('\n\r'),'mform':Mform.strip('\n\r'),'error':err[0]}
+                state[i] = sm
+            
+            elif 'awg' in i:
+                err = (await inst[i].query('syst:err?')).strip('\n\r').split(',')
+                x = await inst[i].run_state()
+                if x == 1 or x == 2:
+                    output = 'RUN'
+                else:
+                    output = 'OFF'
+                sm = {'error':err[0],'output':output}
+                for j in range(8):
+                    output_state = await inst[i].output_state(ch=(j+1))   
+                    sm[f'ch{j+1}'] = 'ON' if output_state else 'OFF'        
+                state[i] = sm
+            else:
+                current = await inst[i].getValue('Offset')
+                load = await inst[i].getValue('Load')
+                load = eval((load).strip('\n\r'))  
+                load = 'high Z' if load != 50 else 50
+                err = (await inst[i].query('syst:err?')).strip('\n\r').split(',')
+                sm = {'offset':current,'load':load,'error':err[0]}
+                state[i] = sm
+        finally:
+            pass
+    measure.inststate = state
+    return state
+
+################################################################################
+# 初始化仪器
+################################################################################
+
+async def InitInst(measure,psgdc=True,awgch=True,clearwaveseq=None):
+    if psgdc:
+        await close(measure)
+    if awgch:
+        for i in measure.awg:
+            for j in range(8):
+                await measure.awg[i].output_off(ch=j+1)
+    if clearwaveseq != None:
+        for i in clearwaveseq:
+            await measure.awg[i].stop()
+            #await measure.awg[i].query('*OPC?')
+            await measure.awg[i].clear_waveform_list()
+            await measure.awg[i].clear_sequence_list()
+            measure.wave = {}
+
+################################################################################
+# 恢复仪器最近状态
+################################################################################
+
+async def RecoverInst(measure,state=None):
+    if state is None:
+        state = measure.inststate
+    for i in state:
+        if 'psg' in i:
+            await measure.psg[i].setValue('Frequency',eval(state[i]['freq'].strip('GHz'))*1e9)
+            await measure.psg[i].setValue('Power',eval(state[i]['power'].strip('dBm')))
+            if state[i]['output'] == '1':
+                await measure.psg[i].setValue('Output','ON')
+            else:
+                await measure.psg[i].setValue('Output','OFF')
+        elif 'awg' in i:
+            awg = measure.awg[i]
+            output = state[i]['output']
+            if output == 'RUN':
+                await awg.run()
+            else:
+                await awg.stop()
+            for j in range(8):
+                output_state = state[i][f'ch{j+1}']
+                if output_state == 'ON':
+                    await awg.output_on(ch=(j+1))
+                if output_state == 'OFF':
+                    await awg.output_off(ch=(j+1))
+        else:
+            await measure.dc[i].DC(state[i]['offset'])
 
 ################################################################################
 # 询问AWG状态
@@ -134,18 +247,43 @@ async def couldRun(awg,chlist=None,namelist=None):
         if x == 1 or x == 2:
             break
 
+async def openandcloseAwg(measure,state):
+    if state == 'ON':
+        await couldRun(measure.awg['awg131'])
+        await couldRun(measure.awg['awg132'])
+        await couldRun(measure.awg['awg134'])
+        time.sleep(1)
+        await couldRun(measure.awg['awg133'])
+    if state == 'OFF':
+        await measure.awg['awg131'].stop()
+        await measure.awg['awg132'].stop()
+        await measure.awg['awg134'].stop()
+        await measure.awg['awg133'].stop()
 ################################################################################
 # awg清理sequence
 ################################################################################
 
 async def clearSeq(measure,awg):
-    for i in awg:
-        await measure.awg[i].stop()
-        await measure.awg[i].write('*WAI')
+    if isinstance(awg, list):
+        for i in awg:
+            await measure.awg[i].stop()
+            await measure.awg[i].write('*WAI')
+            for j in range(8):
+                await measure.awg[i].output_off(ch=j+1)
+            await measure.awg[i].clear_sequence_list()
+    elif isinstance(awg, str):
+        await measure.awg[awg].stop()
+        await measure.awg[awg].write('*WAI')
         for j in range(8):
-            await measure.awg[i].output_off(ch=j+1)
-        await measure.awg[i].clear_sequence_list()
-    measure.wave = {}
+            await measure.awg[awg].output_off(ch=j+1)
+        await measure.awg[awg].clear_sequence_list()
+    else:
+        await awg.stop()
+        await awg.write('*WAI')
+        for j in range(8):
+            await awg.output_off(ch=j+1)
+        await awg.clear_sequence_list()
+    # measure.wave = {}
 
 ################################################################################
 # awg载入sequence
@@ -160,7 +298,7 @@ async def awgchmanage(awg,seqname,ch):
         await awg.output_on(ch=i)
     await couldRun(awg)
     return
-    
+
 ################################################################################
 # awg生成并载入waveform
 ################################################################################
@@ -175,59 +313,73 @@ async def genwaveform(awg,wavname,ch,t_list=t_list):
         await awg.output_on(ch=ch[j])
 
 ################################################################################
+# awg生成子sequence
+################################################################################
+
+async def subSeq(measure,awg,subkind,wavename):
+    await awg.set_sequence_step(subkind,wavename,1,wait='OFF')
+    await awg.set_sequence_step(subkind,['zero','zero'],2,wait='OFF',goto='FIRST',repeat=160) #####repeat乘以zero的长度就是pad的时间长度
+
+################################################################################
 # 生成Sequence
 ################################################################################
 
-async def genSeq(measure,awg,kind):
+async def genSeq(measure,awg,kind,mode='vbroadcast'):
     await awg.stop()
-    await awg.create_waveform(name='zero', length=2400, format=None)
-    wait = 'ATR' if awg == measure.awg['awg_trig'] else 'ATR'
-    await awg.create_sequence(kind,1000,8)
-    for j,i in enumerate(measure.wave[kind],start=1):
-        await awg.set_seq(i,1,j,seq_name=kind,wait=wait)
-        for k in np.arange((len(i)+2),1001):
-            await awg.write('SLIS:SEQ:STEP%d:TASS%d:WAV "%s","%s"' %(k, j, kind, 'zero'))
+    await awg.create_waveform(name='zero', length=2500, format=None)
+    
+    if mode == 'vbroadcast':
+        await awg.create_sequence(kind,(len(measure.wave[kind][0])+1),2)
+        await ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=len(measure.wave[kind][0]),mode='vbroadcast')
+        wait = 'ITR' if awg == measure.awg['awg_trig'] else 'BTR'
+        for j,i in enumerate(measure.wave[kind][:2],start=1):
+            await awg.set_seq(i,1,j,seq_name=kind,wait=wait,firstwait='ATR')
+            # for k in np.arange((len(i)+2),1001):
+            #     await awg.write('SLIS:SEQ:STEP%d:TASS%d:WAV "%s","%s"' %(k, j, kind, 'zero'))
+    if mode == 'hbroadcast':
+        wait = 'ITR' if awg == measure.awg['awg_trig'] else 'BTR'
+        await awg.create_sequence(kind,(len(measure.wave[kind][0])+1),2)
+        await ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=measure.repeat,mode='hbroadcast')
+        # await awg.create_sequence('zero_sub',1,2)
+        # await awg.set_sequence_step('zero_sub',['zero','zero'],1)
+        name_sub_list = measure.wave[kind][-1]
+        wavenameIQ = np.array(measure.wave[kind][0:2])
 
-################################################################################
-# 生成读出Sequence
-################################################################################
+        await subSeq(measure,awg,name_sub_list[0],wavenameIQ[:,0])
+        await awg.set_sequence_step(kind,name_sub_list[0],1,wait=wait,goto='NEXT',repeat='INF',jump=('ATR','NEXT'))
 
-async def readSeq(measure,awg,kind,ch):
-
-    wait = 'ATR' if awg == measure.awg['awg_trig'] else 'ATR'
-    await awg.create_waveform(name='zero', length=100, format=None)
-    await awg.create_sequence(kind,1000,8)
-    for j,i in enumerate(measure.wave[kind],start=1):
-        await awg.set_seq(i,1,j,seq_name=kind,wait=wait)
-        for k in np.arange((len(i)+2),1001):
-            await awg.write('SLIS:SEQ:STEP%d:TASS%d:WAV "%s","%s"' %(k, j, kind, 'zero'))
-    await awgchmanage(awg,kind,ch)
+        for j, i in enumerate(name_sub_list,start=2):
+            await subSeq(measure,awg,i,wavenameIQ[:,(j-2)])
+            # goto = 'FIRST' if j == len(name_sub_list) else 'NEXT'
+            goto = 'FIRST' if j == (len(name_sub_list)+1) else 'NEXT'
+            await awg.set_sequence_step(kind,i,j,wait=wait,goto=goto,repeat='INF',jump=('ATR',goto))
+        # for k in np.arange((len(name_sub_list)+1),1001):
+        #     await awg.set_sequence_step(kind,'zero_sub',int(k))
+            # for l in range(2):
+            #     await awg.write('SLIS:SEQ:STEP%d:TASS%d:WAV "%s","%s"' %(k, (l+1), kind, 'zero'))
 
 ################################################################################
 # 打包sequence
 ################################################################################
 
-async def gen_packSeq(measure,kind,awg,name,steps,readseq=True):
-   
-    await create_wavelist(measure,kind,(awg,name,steps,len(measure.t_list)))
-    await genSeq(measure,awg,kind)
+async def gen_packSeq(measure,kind,awg,name,steps,readseq=True,mode='vbroadcast'):
+    if measure.mode != mode or measure.steps != steps:
+        measure.mode = mode
+        measure.steps = steps
+        state = await QueryInst(measure)
+        await clearSeq(measure,[f'awg13{i+1}' for i in range(4)])
+        await RecoverInst(measure,state)
+        # await clearSeq(measure,'awgread')
+    await create_wavelist(measure,kind,(awg,name,steps,len(measure.t_list),mode))
+    await genSeq(measure,awg,kind,mode=mode)
     if readseq:
-        measure.wave['Read'] = [['Readout_I']*steps,['Readout_Q']*steps]
+        measure.wave['Read'] = [['Readout_I']*steps,['Readout_Q']*steps,['Read_sub']*steps]
+        await measure.awg['awgread'].create_sequence('Read_sub',2,2)
         # await readSeq(measure,measure.awg['awgread'],'Read',[1,5])
-        await genSeq(measure,measure.awg['awgread'],'Read')
+        await genSeq(measure,measure.awg['awgread'],'Read',mode=mode)
         await awgchmanage(measure.awg['awgread'],'Read',[1,5])
-        await ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=steps,awg=1)
-
-################################################################################
-# awg生成子sequence
-################################################################################
-
-async def subSeq(measure,awg,subkind,lensubseq):
-    subkind = ''.join(('sub_',subkind))
-    await create_wavelist(measure,subkind,(awg,['I','Q'],lensubseq,len(measure.t_list)))
-    name = np.array(measure.wave[subkind])
-    for i, j in enumerate(name,start=1):
-        await awg.set_sequence_step(subkind,j,i,wait='ATR',goto='NEXT',repeat=1,jump=('OFF','NEXT'))
+        # await ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=steps,awg=1)
+        # await ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=measure.repeat,awg=1)
         
 ################################################################################
 # awgDC波形
@@ -289,7 +441,7 @@ def predistort(waveform, sRate, zCali):
 ################################################################################
 # 更新波形
 ################################################################################
-
+# @functools.lru_cache()
 async def writeWave(awg,name,pulse,norm=False,t=t_new,mark=False):
 
     # t = np.linspace(-90000,10000,25000)*1e-9
@@ -344,8 +496,8 @@ def whichEnvelope(pi_len,envelope,num):
 # 设置采集卡
 ################################################################################
 
-async def ats_setup(ats,delta,l=1000,repeats=500,awg=0):
-    await ats.set(n=l,repeats=repeats,awg=awg,
+async def ats_setup(ats,delta,l=1000,repeats=500,mode=None):
+    await ats.set(n=l,repeats=repeats,mode=mode,
                            f_list=delta,
                            maxlen=512,
                            ARange=1.0,
@@ -359,41 +511,76 @@ async def ats_setup(ats,delta,l=1000,repeats=500,awg=0):
 # 读出混频
 ################################################################################
 
-async def modulation_read(measure,delta,readlen=1100,repeats=512,phase=0.0,rname=['Readout_I','Readout_Q']):
-    t_list, ats, awg = measure.t_list, measure.ats, measure.awg['awgread']
-    await awg.stop()
-    readamp = measure.readamp
-    twidth, n, measure.readlen = readlen, len(delta), readlen
-    wavelen = (twidth // 64) * 64
-    if wavelen < twidth:
-        wavelen += 64
-    measure.wavelen = int(wavelen) 
-
-    await genwaveform(awg,rname,[1,5])
+# async def readWave(measure,delta,readlen=1100,repeats=512,phase=0.0):
     
-    ringup = 100
-    # pulse1 = wn.square((wavelen-ringup)/1e9) >> ((wavelen+ringup)/ 1e9 / 2)
-    pulse1 = wn.square(wavelen/1e9) >> (wavelen/ 1e9 / 2 + ringup / 1e9)
-    pulse2 = wn.square(ringup/1e9)>>(ringup/2/1e9)
-    pulse = readamp*pulse1+pulse2
+#     readamp = measure.readamp
+#     twidth, n, measure.readlen, measure.repeat = readlen, len(delta), readlen, (repeats // 64 + 1) * 64
+#     wavelen = (twidth // 64) * 64
+#     if wavelen < twidth:
+#         wavelen += 64
+#     measure.wavelen = int(wavelen) 
 
-    mrkp1 = wn.square(25000e-9) << (25000e-9 / 2 + 300e-9)
-    mrkp2 = wn.square(wavelen/1e9) >> (wavelen / 1e9 / 2 + 440 / 1e9 + ringup / 1e9)
-    # mrkp3 = wn.square(4000/1e9) >> 1000/1e9
-    mrkp4 = wn.square(5000/1e9) << (2500+84995)/1e9
+#     ringup = 100
+#     # pulse1 = wn.square((wavelen-ringup)/1e9) >> ((wavelen+ringup)/ 1e9 / 2)
+#     pulse1 = wn.square(wavelen/1e9) >> (wavelen/ 1e9 / 2 + ringup / 1e9)
+#     pulse2 = wn.square(ringup/1e9)>>(ringup/2/1e9)
+#     pulse = readamp*pulse1+pulse2*0.8
+
+#     mrkp1 = wn.square(25000e-9) << (25000e-9 / 2 + 500e-9)
+#     mrkp2 = wn.square(wavelen/1e9) >> (wavelen / 1e9 / 2 + 440 / 1e9 + ringup / 1e9)
+#     # mrkp3 = wn.square(4000/1e9) >> 1000/1e9
+#     mrkp4 = wn.square(5000/1e9) << (2500+84999)/1e9
+#     I, Q = wn.zero(), wn.zero()
+#     for i in delta:
+#         wav_I, wav_Q = wn.mixing(pulse,phase=phase,freq=i,ratioIQ=-1.0)
+#         I, Q = I + wav_I, Q + wav_Q
+#     I, Q = I / n, Q / n
+#     pulselist = I, Q, np.array((mrkp2,mrkp4,mrkp4,mrkp4)), np.array((mrkp2,mrkp4,mrkp1,mrkp4))
+#     return pulselist
+
+async def readWave(measure,delta,readlen=1100,repeats=512,phase=0.0):
+    readamp = measure.readamp
+    ringup = measure.ringup
+    ringupamp = measure.ringupamp
+    twidth, n, measure.readlen, measure.repeat = readlen, len(delta), readlen, (repeats // 64 + 1) * 64
+    wavelen = (twidth // 64 + 1) * 64
+    # if wavelen < twidth:
+    #     wavelen += 64
+    measure.wavelen = int(wavelen) 
+    
+    wavelen = wavelen 
+
     I, Q = wn.zero(), wn.zero()
-    for i in delta:
+    for j,i in enumerate(delta):
+        pulse_ringup = (whichEnvelope(ringup[j]/1e9,*['square',1]) >> ringup[j]/1e9) * ringupamp[j]
+        pulse_read = (whichEnvelope(wavelen/1e9,*['square',1]) >> (wavelen/1e9+ringup[j]/1e9)) * readamp[j]
+        pulse = pulse_ringup + pulse_read
         wav_I, wav_Q = wn.mixing(pulse,phase=phase,freq=i,ratioIQ=-1.0)
         I, Q = I + wav_I, Q + wav_Q
-    I, Q = I / n, Q / n
-    pulselist = I, Q, (mrkp2,), (mrkp4,mrkp4,mrkp1,mrkp4)
+    I, Q = I , Q 
+
+    mrkp1 = wn.square(25000e-9) << (25000e-9 / 2 + 500e-9)
+    mrkp2 = wn.square(wavelen/1e9) >> (wavelen / 1e9 / 2 + 440 / 1e9 + 2*np.max(ringup) / 1e9)
+    # mrkp3 = wn.square(4000/1e9) >> 1000/1e9
+    mrkp4 = wn.square(5000/1e9) << (2500+84999)/1e9
+    
+    pulselist = I, Q, np.array((mrkp2,mrkp4,mrkp4,mrkp4)), np.array((mrkp2,mrkp4,mrkp1,mrkp4))
+
+    return pulselist
+
+async def modulation_read(measure,delta,readlen=1100,repeats=512,phase=0.0,rname=['Readout_I','Readout_Q']):
+    # pulselist = await funcarg(readWave)
+    # n = len(delta)
+    ats, awg = measure.ats, measure.awg['awgread']
+    await awg.stop()
+    pulselist = await readWave(measure,delta,readlen,repeats,phase)
+    await genwaveform(awg,rname,[1,5])
     await writeWave(awg,rname,pulselist,False,mark=True)
-    await awg.setValue('Vpp',1.5*n,ch=1)
-    await awg.setValue('Vpp',1.5*n,ch=5)
+    # await awg.setValue('Vpp',1.5*n,ch=1)
+    # await awg.setValue('Vpp',1.5*n,ch=5)
     await awg.write('*WAI')
     await ats_setup(ats,delta,l=readlen,repeats=repeats)
     await couldRun(awg)
-    return pulselist
 
 ################################################################################
 # 激励混频
@@ -419,8 +606,8 @@ async def rabiWave(envelopename=['square',1],nwave=1,amp=1,pi_len=75e-9,shift=0,
     mwav = wn.square(2*pi_len) << (pi_len+shift)
     pulse, mpulse = wn.zero(), wn.zero()
     for i in range(nwave):
-        pulse += (wave << envelopename[1]*i*pi_len)
-        mpulse += (mwav << envelopename[1]*i*pi_len)
+        pulse += (wave << (envelopename[1]*i*pi_len + i*10e-9))
+        mpulse += (mwav << (envelopename[1]*i*pi_len + i*10e-9))
     wav_I, wav_Q = wn.mixing(pulse,phase=phase,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
 
     return wav_I, wav_Q, mpulse, mpulse
@@ -429,36 +616,14 @@ async def rabiWave(envelopename=['square',1],nwave=1,amp=1,pi_len=75e-9,shift=0,
 # Rabi_seq
 ################################################################################
 
-async def Rabi_sequence(qubit,measure,kind,t_rabi):
+async def Rabi_sequence(qubit,measure,kind,v_or_t,arg,**paras):
+    # print(v_or_t,arg,paras)
     awg= measure.awg[qubit.inst['ex_awg']]
     await awg.stop()
-    for j,i in enumerate(tqdm(t_rabi,desc=''.join(('Rabi_',kind)))):
+    for j,i in enumerate(tqdm(v_or_t,desc=''.join(('Rabi_',kind)))):
+        paras[arg] = i
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
-        pulse = await funcarg(rabiWave,qubit,pi_len=i/1e9)
-        await writeWave(awg,name_ch,pulse,mark=False)
-
-################################################################################s
-# RabiPower_seq
-################################################################################
-
-async def RabiPower_sequence(qubit,measure,kind,amp):
-    awg= measure.awg[qubit.inst['ex_awg']]
-    await awg.stop()
-    for j,i in enumerate(tqdm(amp,desc=''.join(('RabiPower_',kind)))):
-        name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
-        pulse = await funcarg(rabiWave,qubit,amp=i)
-        await writeWave(awg,name_ch,pulse,mark=False)
-
-################################################################################s
-# T1_seq
-################################################################################
-
-async def T1_sequence(qubit,measure,kind,t_T1):
-    awg= measure.awg[qubit.inst['ex_awg']]
-    await awg.stop()
-    for j,i in enumerate(tqdm(t_T1,desc=''.join(('T1_',kind)))):
-        name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
-        pulse = await funcarg(rabiWave,qubit,shift=i/1e9)
+        pulse = await funcarg(rabiWave,qubit,**paras)
         await writeWave(awg,name_ch,pulse,mark=False)
 
 ################################################################################
@@ -514,34 +679,13 @@ async def coherenceWave(envelopename=['square',1],t_run=0,amp=1,pi_len=75e-9,nwa
     
     return wavI, wavQ, wn.zero(), wn.zero()
 
-# async def ramseyWave(envelopename=['square',1],t_run=0,amp=1,pi_len=75e-9,nwave=0,seqtype='CPMG',\
-#     detune=3e6,shift=0e-9,delta_ex=110e6,phaseDiff=0.0,DRAGScaling=None):
-#     # print(t_run,pi_len,envelopename,detune,seqtype,nwave,amp)
-#     shift += 200e-9
-#     envelope = whichEnvelope(pi_len,envelopename[0],1)
-#     cosPulse1 = envelope << shift
-#     wav_I1, wav_Q1 = wn.mixing(cosPulse1,phase=2*np.pi*detune*t_run,freq=delta_ex,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
-    
-#     cosPulse2 = envelope << (t_run+shift+pi_len)
-#     wav_I2, wav_Q2 = wn.mixing(cosPulse2,phase=0.0,freq=delta_ex,ratioIQ=-1.0,phaseDiff=0.0,DRAGScaling=None)
-#     wav_I, wav_Q = wav_I1 + wav_I2, wav_Q1 + wav_Q2
-
-#     return wav_I, wav_Q, wn.zero(), wn.zero()
-
-# async def Coherence_sequence(measure,kind,awg,t_rabi,halfpi,nwave=0,seqtype='PDD'):
-#     # t_range, sample_rate = measure.t_range, measure.sample_rate
-
-#     for j,i in enumerate(tqdm(t_rabi,desc='Coherence')):
-#         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
-#         pulse = await coherenceWave(measure,i/1e9,halfpi/1e9,nwave,seqtype)
-#         await writeWave(awg,name_ch,pulse)
-
-async def Coherence_sequence(qubit,measure,kind,t):
+async def Coherence_sequence(qubit,measure,kind,v_or_t,arg,**paras):
     awg= measure.awg[qubit.inst['ex_awg']]
     await awg.stop()
-    for j,i in enumerate(tqdm(t,desc=''.join(('Coherence_',kind)))):
+    for j,i in enumerate(tqdm(v_or_t,desc=''.join(('Coherence_',kind)))):
+        paras[arg] = i
         name_ch = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
-        pulse = await funcarg(coherenceWave,qubit,t_run=i/1e9)
+        pulse = await funcarg(coherenceWave,qubit,**paras)
         await writeWave(awg,name_ch,pulse,mark=False)
 
 ################################################################################
@@ -558,42 +702,44 @@ async def Z_cross_sequence(measure,kind_z,kind_ex,awg_z,awg_ex,v_rabi,halfpi):
         await writeWave(awg_z,np.array(measure.wave[kind_z])[:,j],pulse_z)
 
 ################################################################################
-# Speccrosstalk波形
-################################################################################
-
-async def Speccrosstalk_sequence(measure,qubit,kind_z,kind_ex,v_rabi,halfpi):
-    awg_z, awg_ex = measure.awg[qubit.inst['z_awg']], measure.awg[qubit.inst['ex_awg']]
-    for j,i in enumerate(tqdm(v_rabi,desc='Speccrosstalk_sequence')):
-        name_ch = [measure.wave[kind_ex][0][j],measure.wave[kind_ex][1][j]]
-        pulse_ex = await funcarg(rabiWave,qubit,pi_len=halfpi/1e9,shift=(100)*1e-9)
-        await writeWave(awg_ex,name_ch,pulse_ex)
-        pulse_z = (wn.square(1100/1e9) << (200)/1e9) * i
-        await writeWave(awg_z,np.array(measure.wave[kind_z])[:,j],pulse_z)
-
-################################################################################
 # AC-Stark波形
 ################################################################################
 
-async def ac_stark_wave(measure):
-    awg = measure.awg['awgread']
-    pulse_read = await modulation_read(measure,measure.delta,readlen=measure.readlen)
-    width = 500e-9
-    pulse = (wn.square(width) << (width/2+3000e-9)) * 1
+async def ac_stark_wave(measure,power=1):
+    # awg = measure.awg['awgread']
+    pulse_read = await readWave(measure,measure.delta,readlen=measure.readlen)
+    width = 1000e-9
+    pulse = (wn.square(width) << (width/2+3000e-9)) * power
     I, Q = wn.zero(), wn.zero()
     for i in measure.delta:
         wav_I, wav_Q = wn.mixing(pulse,phase=0.0,freq=i,ratioIQ=-1.0)
         I, Q = I + wav_I, Q + wav_Q
-    pulse_acstark = (I,Q,wn.zero(),wn.zero())
+    pulse_acstark = (I,Q,np.array((wn.zero(),)),np.array(((wn.zero(),)*4)))
     pulselist = np.array(pulse_read) + np.array(pulse_acstark)
-    await writeWave(awg,['Readout_I','Readout_Q'],pulselist)
+    # await writeWave(awg,['Readout_I','Readout_Q'],pulselist)
+    return pulselist
+
+async def acstarkSequence(measure,kind,v_or_t,arg,**paras):
+
+    awg = measure.awg['awgread']
+    for j,i in enumerate(tqdm(v_or_t,desc='acStark')):
+        paras[arg] = i
+        # pulse_z = await funcarg(ac_stark_wave,qubit,**paras)
+        pulse_z = await ac_stark_wave(measure,**paras)
+        name_z = [measure.wave[kind][0][j],measure.wave[kind][1][j]]
+        await writeWave(awg,name_z,pulse_z,False,mark=True)
     
 ################################################################################
 # ZPulse波形
 ################################################################################
 
-async def zWave(volt=0.4,pi_len=500e-9,shift=1000e-9,offset=0,timing={'z>xy':0,'read>xy':0}):
+async def zWave(volt=0.4,pi_len=500e-9,shift=1000e-9,offset=0,timing={'z>xy':0,'read>xy':0},delta_im=0,imAmp=0):
     shift += timing['read>xy'] - timing['z>xy']
     pulse = (wn.square(pi_len) << (pi_len/2 + shift)) * volt + offset
+    pulse_im = (wn.square(pi_len) << (pi_len/2 + shift))
+    if delta_im != 0:
+        wav_I, wav_Q = wn.mixing(imAmp*pulse_im,phase=0.0,freq=delta_im,ratioIQ=-1.0)
+        pulse += wav_I
     pulselist = (pulse,) 
     # await writeWave(awg,name,pulselist)
     return pulselist
@@ -602,15 +748,15 @@ async def zWave(volt=0.4,pi_len=500e-9,shift=1000e-9,offset=0,timing={'z>xy':0,'
 # 偏置sequence
 ################################################################################
 
-async def Z_sequence(measure,qubit,kind,t_rabi,volt):
-    z_awg = qubit.inst['z_awg']
-    await z_awg.stop()
-    for j,i in enumerate(tqdm(t_rabi,desc='Z_sequence')):
-        name_ch = [measure.wave[kind][0][j]]
-        pulse = await funcarg(zWave,qubit,pi_len=i/1e9,volt=volt)
-        await writeWave(awg,name_ch,pulse,mark=False)
-        # pulse = await zWave(z_awg,name_ch,volt=volt,pi_len=i*1e-9,shift=shift)
-        # await writeWave(z_awg,name_ch,pulse)
+async def Z_sequence(qubit,measure,kind,v_or_t,arg,**paras):
+
+    awg_z = measure.awg[qubit.inst['z_awg']]
+    for j,i in enumerate(tqdm(v_or_t,desc='Z_sequence')):
+        paras[arg] = i
+        pulse_z = await funcarg(zWave,qubit,**paras)
+        name_z = [measure.wave[kind][0][j]]
+        await writeWave(awg_z,name_z,pulse_z)
+
 
 ################################################################################
 # 单比特tomo波形
@@ -621,11 +767,11 @@ async def singleQgate(envelopename=['square',1],pi_len=30e-9,amp=1,shift=0,delta
     
     shift += timing['read>xy']
     if envelopename[1] == 1:
-        envelope_pi = whichEnvelope(pi_len,*envelopename) * amp 
-        envelope_half = whichEnvelope(pi_len,*envelopename) * 0.5 * amp 
+        envelope_pi = whichEnvelope(pi_len,*envelopename) * amp << shift
+        envelope_half = whichEnvelope(pi_len,*envelopename) * 0.5 * amp << shift
     if envelopename[1] == 2:
-        envelope_pi = whichEnvelope(pi_len,*envelopename) * amp 
-        envelope_half = whichEnvelope(pi_len,envelopename[0],1) * amp 
+        envelope_pi = whichEnvelope(pi_len,*envelopename) * amp << shift
+        envelope_half = whichEnvelope(pi_len,envelopename[0],1) * amp << shift
 
     if axis == 'X':
         phi = 0
