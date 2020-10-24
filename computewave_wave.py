@@ -11,7 +11,7 @@
 '''
 
 # here put the import lib
-import numpy as np, time, pickle, datetime
+import numpy as np, time, pickle, datetime, scipy
 from easydl import clear_output
 from qulab.wavepoint import WAVE_FORM as WF
 from qulab.waveform import CosPulseDrag, Expi, DC, Step, Gaussian, CosPulse
@@ -242,8 +242,8 @@ async def couldRun(awg,chlist=None,namelist=None):
             await awg.output_on(ch=i)
     # time.sleep(5)
     while True:
-        time.sleep(0.5)
         x = await awg.run_state()
+        time.sleep(0.5)
         if x == 1 or x == 2:
             break
 
@@ -328,58 +328,57 @@ async def genSeq(measure,awg,kind,mode='vbroadcast'):
     await awg.stop()
     await awg.create_waveform(name='zero', length=2500, format=None)
     
-    if mode == 'vbroadcast':
-        await awg.create_sequence(kind,(len(measure.wave[kind][0])+1),2)
+    if mode == 'vbroadcast' or 1:
+        # await awg.create_sequence(kind,(len(measure.wave[kind][0])+1),2)
+        await awg.create_sequence(kind,1000,2)
         await ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=len(measure.wave[kind][0]),mode='vbroadcast')
-        wait = 'ITR' if awg == measure.awg['awg_trig'] else 'BTR'
+        wait = 'ATR' if awg == measure.awg['awg_trig'] else 'ATR'
         for j,i in enumerate(measure.wave[kind][:2],start=1):
-            await awg.set_seq(i,1,j,seq_name=kind,wait=wait,firstwait='ATR')
-            # for k in np.arange((len(i)+2),1001):
-            #     await awg.write('SLIS:SEQ:STEP%d:TASS%d:WAV "%s","%s"' %(k, j, kind, 'zero'))
-    if mode == 'hbroadcast':
-        wait = 'ITR' if awg == measure.awg['awg_trig'] else 'BTR'
-        await awg.create_sequence(kind,(len(measure.wave[kind][0])+1),2)
-        await ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=measure.repeat,mode='hbroadcast')
-        # await awg.create_sequence('zero_sub',1,2)
-        # await awg.set_sequence_step('zero_sub',['zero','zero'],1)
-        name_sub_list = measure.wave[kind][-1]
-        wavenameIQ = np.array(measure.wave[kind][0:2])
+            await awg.set_seq(i,1,j,seq_name=kind,wait=wait,firstwait='BTR')
+            for k in np.arange((len(i)+2),1001):
+                await awg.write('SLIS:SEQ:STEP%d:TASS%d:WAV "%s","%s"' %(k, j, kind, 'zero'))
+    # if mode == 'hbroadcast':
+    #     wait = 'ITR' if awg == measure.awg['awg_trig'] else 'BTR'
+    #     await awg.create_sequence(kind,(len(measure.wave[kind][0])+1),2)
+    #     await ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=measure.repeat,mode='hbroadcast')
+    #     # await awg.create_sequence('zero_sub',1,2)
+    #     # await awg.set_sequence_step('zero_sub',['zero','zero'],1)
+    #     name_sub_list = measure.wave[kind][-1]
+    #     wavenameIQ = np.array(measure.wave[kind][0:2])
 
-        await subSeq(measure,awg,name_sub_list[0],wavenameIQ[:,0])
-        await awg.set_sequence_step(kind,name_sub_list[0],1,wait=wait,goto='NEXT',repeat='INF',jump=('ATR','NEXT'))
+    #     await subSeq(measure,awg,name_sub_list[0],wavenameIQ[:,0])
+    #     await awg.set_sequence_step(kind,name_sub_list[0],1,wait=wait,goto='NEXT',repeat='INF',jump=('ATR','NEXT'))
 
-        for j, i in enumerate(name_sub_list,start=2):
-            await subSeq(measure,awg,i,wavenameIQ[:,(j-2)])
-            # goto = 'FIRST' if j == len(name_sub_list) else 'NEXT'
-            goto = 'FIRST' if j == (len(name_sub_list)+1) else 'NEXT'
-            await awg.set_sequence_step(kind,i,j,wait=wait,goto=goto,repeat='INF',jump=('ATR',goto))
-        # for k in np.arange((len(name_sub_list)+1),1001):
-        #     await awg.set_sequence_step(kind,'zero_sub',int(k))
-            # for l in range(2):
-            #     await awg.write('SLIS:SEQ:STEP%d:TASS%d:WAV "%s","%s"' %(k, (l+1), kind, 'zero'))
+    #     for j, i in enumerate(name_sub_list,start=2):
+    #         await subSeq(measure,awg,i,wavenameIQ[:,(j-2)])
+    #         # goto = 'FIRST' if j == len(name_sub_list) else 'NEXT'
+    #         goto = 'FIRST' if j == (len(name_sub_list)+1) else 'NEXT'
+    #         await awg.set_sequence_step(kind,i,j,wait=wait,goto=goto,repeat='INF',jump=('ATR',goto))
+    #     # for k in np.arange((len(name_sub_list)+1),1001):
+    #     #     await awg.set_sequence_step(kind,'zero_sub',int(k))
+    #         # for l in range(2):
+    #         #     await awg.write('SLIS:SEQ:STEP%d:TASS%d:WAV "%s","%s"' %(k, (l+1), kind, 'zero'))
 
 ################################################################################
 # 打包sequence
 ################################################################################
 
 async def gen_packSeq(measure,kind,awg,name,steps,readseq=True,mode='vbroadcast'):
-    if measure.mode != mode or measure.steps != steps:
-        measure.mode = mode
-        measure.steps = steps
-        state = await QueryInst(measure)
-        await clearSeq(measure,[f'awg13{i+1}' for i in range(4)])
-        await RecoverInst(measure,state)
+    # if measure.mode != mode or measure.steps != steps:
+    #     measure.mode = mode
+    #     measure.steps = steps
+    #     state = await QueryInst(measure)
+    #     await clearSeq(measure,[f'awg13{i+1}' for i in range(4)])
+    #     await RecoverInst(measure,state)
         # await clearSeq(measure,'awgread')
     await create_wavelist(measure,kind,(awg,name,steps,len(measure.t_list),mode))
     await genSeq(measure,awg,kind,mode=mode)
     if readseq:
         measure.wave['Read'] = [['Readout_I']*steps,['Readout_Q']*steps,['Read_sub']*steps]
-        await measure.awg['awgread'].create_sequence('Read_sub',2,2)
-        # await readSeq(measure,measure.awg['awgread'],'Read',[1,5])
+        # await measure.awg['awgread'].create_sequence('Read_sub',2,2)
+
         await genSeq(measure,measure.awg['awgread'],'Read',mode=mode)
         await awgchmanage(measure.awg['awgread'],'Read',[1,5])
-        # await ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=steps,awg=1)
-        # await ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=measure.repeat,awg=1)
         
 ################################################################################
 # awgDC波形
@@ -399,50 +398,102 @@ async def awgDC(awg,wavname,volt):
 # Z波形矫正
 ################################################################################
 
-def predistort(waveform, sRate, zCali):
+def predistort(waveform, sRate, zCali=[0]*10):
     """Predistort input waveform.
     Parameters
     ----------
         waveform : complex numpy array
             Waveform data to be pre-distorted
-        zCali: [2.55e-9, -28e-3, 8.02e-9, -28e-3, 101.5e-9, -14.5e-3,369.7e-9,-6.2e-3]
+        zCali: [2.55e-9, -28e-3, 8.02e-9, -28e-3, 101.5e-9, -14.5e-3, 369.7e-9, -6.2e-3]
     Returns
     -------
     waveform : complex numpy array
         Pre-distorted waveform
     """
+    zCali = np.array(zCali)
+    # zCali[0] = zCali[0]*1e-9
+    zCali[1::2] = -zCali[1::2]
+    zCali[2::2] = 1/zCali[2::2]
     dt = 1 / sRate
     wf_size = len(waveform)
-    tau1, A1, tau2, A2, tau3, A3, tau4, A4, tau5, A5 = zCali
+    # tau1, A1, tau2, A2, tau3, A3, tau4, A4, tau5, A5 = zCali
+    # tau1, A1, tau2, A2, tau3, A3, tau4, A4 = zCali
     # print('tau:', tau1, A1, tau2, A2, tau3, A3, tau4, A4, tau5, A5)
     # pad with zeros at end to make sure response has time to go to zero
     # pad_time = 6 * max([tau1, tau2, tau3])
-    pad_time = 4e-6  # 这里默认改为增加4us的pad，返回时舍去1us，保留3us拖尾
-    pad_size = round(pad_time / dt)
-    pad_size_2 = round(3e-6 / dt)  # 保留的点数
-    padded_zero = np.zeros(pad_size)
-    padded = np.append(waveform,padded_zero)
-
+    # pad_time = 4e-6  # 这里默认改为增加4us的pad，返回时舍去1us，保留3us拖尾
+    # pad_size = round(pad_time / dt)
+    # pad_size_2 = round(3e-6 / dt)  # 保留的点数
+    # padded_zero = np.zeros(pad_size)
+    # padded = np.append(waveform,padded_zero)
+    padded = waveform
     Y = np.fft.rfft(padded, norm='ortho')
 
-    omega = 2 * np.pi * np.fft.rfftfreq(wf_size+pad_size, dt)
-    H = (1 + (1j * A1 * omega * tau1) / (1j * omega * tau1 + 1) +
-         (1j * A2 * omega * tau2) / (1j * omega * tau2 + 1) +
-         (1j * A3 * omega * tau3) / (1j * omega * tau3 + 1) +
-         (1j * A4 * omega * tau4) / (1j * omega * tau4 + 1)+
-         (1j * A5 * omega * tau5) / (1j * omega * tau5 + 1))
+    # omega = 2 * np.pi * np.fft.rfftfreq(wf_size+pad_size, dt)
+    omega = 2 * np.pi * np.fft.rfftfreq(wf_size, dt)
+    # H = (1 + (1j * A1 * omega * tau1) / (1j * omega * tau1 + 1) +
+    #      (1j * A2 * omega * tau2) / (1j * omega * tau2 + 1) +
+    #      (1j * A3 * omega * tau3) / (1j * omega * tau3 + 1) +
+    #      (1j * A4 * omega * tau4) / (1j * omega * tau4 + 1))
+    #     #  (1j * A5 * omega * tau5) / (1j * omega * tau5 + 1))
+    H = 1 + np.sum(1j*zCali[1::2,None]*omega[None,:]*zCali[2::2,None]/(1+1j*omega[None,:]*zCali[2::2,None]),axis=0)
 
     Yc = Y / H
     yc = np.fft.irfft(Yc, norm='ortho')
     # return yc[:wf_size]
     #这里返回增加了3us拖尾的序列
-    return yc[:(wf_size+pad_size_2)]
+    # return yc[:(wf_size+pad_size_2)]
+
+    return np.real(yc)
+
+# def fitfunc(t, p):
+#     #p[2::2] = p[2::2] 
+#     return (t > 0) * (p[0] + np.sum(p[1::2,None]*np.exp(-p[2::2,None]*t[None,:]), axis=0))
+
+# def caliZ(p,height):
+#     p[0] = 0
+#     x = np.arange(250000)*0.4
+#     response = fitfunc(x,p)/(-0.8)*height
+#     c = 1-1j*np.pi*np.fft.fftfreq(len(x),0.4)*np.fft.fft(response)
+#     return c
+def caliZ():
+    samplingRate = 2.5
+    nrfft = 125001
+    expAmpRates = np.array([-9.09959852e-03,  2.62278781e-03,  4.44280751e+00,
+         1.94406545e-02,  2.23982220e+01,  3.10550244e-02,  3.39073078e+01,
+         4.36682358e-02,  6.23829358e+01,  3.10527415e-02,  2.08468191e+02,
+         4.37558448e-02, -1.21453817e+02,  4.72114083e-02, -1.88727646e+02,
+         3.75947562e-02, -2.15021075e+01,  2.36908784e-02])
+    polyParas = np.array([-1.73800702e+04,  3.25858074e-01,  2.45830533e-38, -9.47440111e-37,
+        -2.54910257e-34, -2.26007047e-32,  1.42148960e-30,  3.15674369e-28,
+         9.09994111e-27, -1.11552369e-24, -3.07238079e-22,  9.71147447e-21,
+         1.67660809e-18,  5.30007921e-17, -2.80298082e-14,  2.37347890e-12,
+        -1.05646021e-10,  2.92633025e-09, -5.33188129e-08,  6.48761623e-07,
+        -5.22811126e-06,  2.71196033e-05, -8.56677176e-05,  1.47837817e-04,
+        -1.06585561e-04,  2.58916757e-06])
+    delayParasAND2nd = np.array([100,0,0.4])
+    # nfft = 2*(nrfft-1)
+    # freqs = np.linspace(0, nrfft*1.0/nfft*samplingRate,nrfft, endpoint=False)
+    freqs = np.fft.fftfreq(250000,0.4)
+    i_two_pi_freqs = 1j*np.pi*freqs
+    pExp0 = expAmpRates
+    pExp1 = polyParas[:2]
+    pPoly = polyParas[2:]
+    tCut,tShift,sigma1 = delayParasAND2nd[:3]
+    # tlist = np.arange(2*(nrfft-1),dtype=float)/samplingRate
+    tlist = np.arange(250000,dtype=float)/samplingRate
+    timeFunData = np.sum(pExp0[0::2,None]*np.exp(-pExp0[1::2,None]*tlist[None,:]), axis=0)
+    timeFunData += pExp1[0]*np.exp(-pExp1[1]*tlist)*np.polyval(pPoly,tlist)*(tlist<=tCut+20)
+    # *(0.5-0.5*scipy.special.erf(sigma1*(tlist-tCut+tShift)))*(0.5+0.5*scipy.special.erf(2.0*(tlist+0.5)))
+    timeFunDataf = np.fft.fft(timeFunData)
+    precalc = 1.0/(1.0+timeFunDataf*i_two_pi_freqs)
+    return precalc
 
 ################################################################################
 # 更新波形
 ################################################################################
 # @functools.lru_cache()
-async def writeWave(awg,name,pulse,norm=False,t=t_new,mark=False):
+async def writeWave(awg,name,pulse,norm=False,t=t_new,mark=False,caliparas=None):
 
     # t = np.linspace(-90000,10000,25000)*1e-9
     await awg.stop()
@@ -460,13 +511,51 @@ async def writeWave(awg,name,pulse,norm=False,t=t_new,mark=False):
             mrk2 = [i(t) for i in mrk2]
             await awg.update_marker(name[0],*mrk1)
             await awg.update_marker(name[1],*mrk2)
-    if len(pulse) == 1:
-        wave = pulse[0]
-        # t = np.linspace(-90000,7000,242500)*1e-9
-        # wave = pulse
-        wave = wave(t)
-        # wave = predistort(wave,2.5e9,[2.55e-9, -28e-3, 8.02e-9, -28e-3, 101.5e-9, -14.5e-3,369.7e-9,-6.2e-3,5e-9,-5e-3])
-        await awg.update_waveform(wave, name = name[0])
+    if len(pulse) == 2 or len(pulse) == 1:
+        cali = True
+        if cali:
+            wave1,wave2= pulse
+            # t = np.linspace(-90000,7000,242500)*1e-9
+            # wave = pulse
+            p0 = np.array([-5.13775010e-04, -7.29707149e-03,  2.34635102e-03, -2.99512208e+02,
+        1.60500197e-01,  9.82332083e+02,  1.73124229e-01, -1.02577979e+03,
+        1.93348951e-01, -5.77102776e+02,  2.13865433e-01,  9.52778359e+02,
+        2.05293596e-01,  9.51076166e+02,  2.05276979e-01, -1.34246929e+03,
+        1.93350603e-01,  9.56021338e+02,  2.05271069e-01, -5.97390991e+02,
+        2.13883210e-01])
+            p1 = np.array([-4.53670037e-04,  1.16790346e-01,  1.03614839e-02, -1.10984754e-01,
+        1.00846524e-02,  1.00188822e+00,  4.21953865e-01, -4.26032938e+00,
+        3.64531074e-01,  2.47423106e+00,  4.21957000e-01,  3.92787201e+00,
+        4.21954290e-01,  5.48916652e+00,  4.21951529e-01, -6.14687518e+00,
+        4.85031226e-01, -8.77582484e+00,  4.85043260e-01,  6.25845989e+00,
+        5.38068137e-01])
+            wave1 = wave1(t)
+            height1 = wave1[np.nonzero(wave1)][0]
+            # #print(height1)
+            c1 = caliZ()
+            f_step1 = np.fft.fft(wave1)
+            signal1 = np.real(np.fft.ifft(f_step1*c1))
+            # c = caliZ(p1,1)
+            # signal1 = np.fft.ifft(np.fft.fft(signal1)/c)
+            
+            wave2 = wave2(t)
+            signal2=wave2
+            # if np.any(wave2)!=0:
+            #     height2 = wave2[np.nonzero(wave2)][0]
+            #     c2 = caliZ(p0,1)
+            #     f_step2 = np.fft.fft(wave2)
+            #     signal2 = np.fft.ifft(f_step2/c2)
+            #     c = caliZ(p1,1)
+            #     signal2 = np.fft.ifft(np.fft.fft(signal2)/c)
+                
+            # signal1=wave1
+            signal=signal1+signal2
+        else:
+            wave = pulse[0]
+            signal = wave(t)
+            if caliparas != None:
+                signal = predistort(signal,2.5,caliparas)
+        await awg.update_waveform(np.real(signal), name = name[0])
 
 ################################################################################
 # 波包选择
@@ -496,9 +585,10 @@ def whichEnvelope(pi_len,envelope,num):
 # 设置采集卡
 ################################################################################
 
-async def ats_setup(ats,delta,l=1000,repeats=500,mode=None):
+async def ats_setup(ats,delta,l=1000,repeats=500,mode=None,weight=None):
     await ats.set(n=l,repeats=repeats,mode=mode,
                            f_list=delta,
+                           weight=weight,
                            maxlen=512,
                            ARange=1.0,
                            BRange=1.0,
@@ -568,7 +658,7 @@ async def readWave(measure,delta,readlen=1100,repeats=512,phase=0.0):
 
     return pulselist
 
-async def modulation_read(measure,delta,readlen=1100,repeats=512,phase=0.0,rname=['Readout_I','Readout_Q']):
+async def modulation_read(measure,delta,readlen=1100,repeats=512,phase=0.0,weight=None,rname=['Readout_I','Readout_Q']):
     # pulselist = await funcarg(readWave)
     # n = len(delta)
     ats, awg = measure.ats, measure.awg['awgread']
@@ -579,7 +669,7 @@ async def modulation_read(measure,delta,readlen=1100,repeats=512,phase=0.0,rname
     # await awg.setValue('Vpp',1.5*n,ch=1)
     # await awg.setValue('Vpp',1.5*n,ch=5)
     await awg.write('*WAI')
-    await ats_setup(ats,delta,l=readlen,repeats=repeats)
+    await ats_setup(ats,delta,l=readlen,repeats=repeats,weight=weight)
     await couldRun(awg)
 
 ################################################################################
@@ -733,10 +823,11 @@ async def acstarkSequence(measure,kind,v_or_t,arg,**paras):
 # ZPulse波形
 ################################################################################
 
+
 async def zWave(volt=0.4,pi_len=500e-9,shift=1000e-9,offset=0,timing={'z>xy':0,'read>xy':0},delta_im=0,imAmp=0):
     shift += timing['read>xy'] - timing['z>xy']
-    pulse = (wn.square(pi_len) << (pi_len/2 + shift)) * volt + offset
-    pulse_im = (wn.square(pi_len) << (pi_len/2 + shift))
+    pulse = (wn.square(pi_len,0e-9) << (pi_len/2 + shift)) * volt + offset
+    pulse_im = (wn.square(pi_len,0e-9) << (pi_len/2 + shift))
     if delta_im != 0:
         wav_I, wav_Q = wn.mixing(imAmp*pulse_im,phase=0.0,freq=delta_im,ratioIQ=-1.0)
         pulse += wav_I
