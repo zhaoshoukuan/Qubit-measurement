@@ -17,9 +17,10 @@ from qulab.job import Job
 from qulab.wavepoint import WAVE_FORM as WF
 from collections import Iterable
 from tqdm import tqdm_notebook as tqdm
-from qulab import computewave_wave as cww, optimize as op
+from qulab import computewave_wave, optimize as op, dataTools as dt
 import pandas as pd
-import asyncio
+import asyncio, imp, scipy
+cww = imp.reload(computewave_wave)
 
 t_list = np.linspace(0,100000,250000)
 t_range = (-90e-6, 10e-6)
@@ -31,9 +32,10 @@ sample_rate = 2.5e9
 
 class qubit():
     def __init__(self,**kws):
-        attribute = ['q_name','inst','T_bias','T_z','specfunc','specfunc_cavity','photonnum_func','bias','zpulse','f_lo','delta','f_ex','delta_ex','alpha',\
-             'power_ex','power_rabi','pi_len','T1','state','timing','envelopename','nwave','readamp','ringup','ringup_amp','amp',\
-             'seqtype','detune','shift','phase','phaseDiff','DRAGScaling','volt','offset','vpp']
+        attribute = ['q_name','inst','T_bias','T_z','specinterp','specfunc','specfuncz','specfunc_cavity','photonnum_func','bias','zpulse','f_lo','delta','f_ex','delta_ex','alpha',\
+             'power_ex','power_rabi','pi_len','pi_len2','during','T1','state','timing','envelopename','nwave','readamp','ringup','ringupamp',\
+                 'weight','readmatrix','amp','amp2','zCali',\
+             'seqtype','detune','shift','phaseim','phase','phaseDiff','DRAGScaling','volt','offset','vpp']
         for j in attribute:
             self.__setattr__(j,None)
         if len(kws) != 0:
@@ -211,25 +213,72 @@ def concurrence(task):
 # 获取数据
 ################################################################################
 
-async def yieldData(measure,x,len_data=100,mode='hbroadcast'):
+def getSamplesPerRecode(numOfPoints):
+    samplesPerRecord = (numOfPoints // 64 - 1) * 64
+    return samplesPerRecord
 
-    if mode == 'hbroadcast':
-        for i in x:
-            ch_A, ch_B, I, Q = await measure.ats.getIQ()
-            Am, Bm = ch_A.mean(axis=0),ch_B.mean(axis=0)
-            # theta0 = np.angle(Am) - np.angle(Bm)
-            # Bm *= np.exp(1j*theta0)
-            s = Am + 1j*Bm
-            n = np.shape(s)[-1]
-            yield [i]*n, s - measure.base
-    if mode == 'vbroadcast':
-        for i in range(300):
-            ch_A, ch_B, I, Q = await measure.ats.getIQ()
-            Am, Bm = ch_A[1:len_data+1,:],ch_B[1:len_data+1,:]
-            # theta0 = np.angle(Am) - np.angle(Bm)
-            # Bm *= np.exp(1j*theta0)
-            s = Am + 1j*Bm
-            yield x, s - measure.base
+def getExpArray(f_list, numOfPoints, weight=None, sampleRate=1e9):
+    samplesPerRecord = getSamplesPerRecode(numOfPoints)
+    t = np.arange(0, samplesPerRecord, 1) / sampleRate
+    e = []
+    for i,f in enumerate(f_list):
+        weight_m = np.asarray(weight[i])
+        if weight_m is None:
+            weight_m = np.ones(samplesPerRecord)
+        e.append(weight_m * np.exp(-1j * 2 * np.pi * f * t))
+    return np.asarray(e).T
+
+async def yieldData(measure,avg=False,fft=False,offset=True,is2ch=False):
+
+    # chA, chB, ch_I, ch_Q = await measure.ats.getTraces(avg=avg,fft=fft,hilbert=False)
+    A_lst, B_lst = measure.ats.getData(offset)
+    weight = []
+    for j, i in enumerate(measure.qubitToread):
+        qubit = measure.qubits[i]
+        weight.append(qubit.weight)
+    e = getExpArray(measure.delta,measure.readlen,weight)
+    n = e.shape[-1]
+    if hilbert:
+        Analysis_cos = signal.hilbert(A_lst,axis=1)
+        Analysis_sin = signal.hilbert(B_lst,axis=1)
+        # theta = np.angle(Analysis_cos) - np.angle(Analysis_sin)
+        # Analysis_sin *= np.exp(1j*(theta))
+        # A_lst, B_lst = (np.real(Analysis_cos) + np.real(Analysis_sin)), (np.imag(Analysis_cos) + np.imag(Analysis_sin)) 
+        if is2ch:
+            A_lst, B_lst = (np.real(Analysis_cos) - np.imag(Analysis_sin)), (np.imag(Analysis_cos) + np.real(Analysis_sin))
+        else: 
+            A_lst, B_lst = np.real(Analysis_cos), np.imag(Analysis_cos)
+            A_lst_Q, B_lst_Q = np.real(Analysis_sin), np.imag(Analysis_sin)
+    if fft:
+        A_lst = (A_lst[:, :n]).dot(e)
+        B_lst = (B_lst[:, :n]).dot(e)
+        if hilbert and is2ch == False:
+            A_lst_Q = (A_lst_Q[:, :n]).dot(e)
+            B_lst_Q = (B_lst_Q[:, :n]).dot(e)
+    if avg:
+        if hilbert and is2ch == False:
+            return A_lst.mean(axis=0), B_lst.mean(axis=0), A_lst_Q.mean(axis=0), B_lst_Q.mean(axis=0)
+        else:
+            return A_lst.mean(axis=0), B_lst.mean(axis=0), np.array([0]), np.array([0])
+    else:
+        if hilbert and is2ch == False:
+            return A_lst, B_lst, A_lst_Q, B_lst_Q
+        else:
+            return A_lst, B_lst, np.array([0]), np.array([0])
+    
+
+################################################################################
+# 读出校准
+################################################################################
+
+def readPop(measure,ss):
+    d = [list(zip(np.real(ss)[:,i],np.imag(ss)[:,i])) for i in range(np.shape(ss)[1])]
+    y = [measure.predict[j](d[i]) for i, j in enumerate(measure.qubitToread)]
+    pop = np.count_nonzero(y,axis=1)/np.shape(y)[1]
+    pop_on = np.array([pop[i] if measure.onwhich[j] == 1 else 1-pop[i] for i, j in enumerate(measure.qubitToread)])
+    pop_off = np.array([pop[i] if measure.offwhich[j] == 1 else 1-pop[i] for i, j in enumerate(measure.qubitToread)])
+    pop_cali = [np.array(np.mat(measure.readmatrix[j]).I*np.mat([pop_off[i],pop_on[i]]).T)[:,0] for i, j in enumerate(measure.qubitToread)]
+    return pop_cali
 
 ################################################################################
 # AWG恢复设置
@@ -244,16 +293,16 @@ async def resetAwg(awg):
             await awg[i].setValue('Vpp',1.5,ch=j+1)
             await awg[i].setValue('Offset',0,ch=j+1)
             await awg[i].write('OUTPUT%d:WVALUE:ANALOG:STATE %s'%(j+1,'FIRST'))  #FIRST, ZERO
-            await awg[i].write('SOUR%d:TINP %s'%((j+1),'BTR'))        
+            await awg[i].write('SOUR%d:TINP %s'%((j+1),'ATR'))        
             for k in range(4):
                 await awg[i].write('OUTPUT%d:WVALUE:MARKER%d %s'%(j+1,(k+1),'FIRST'))            #FIRST, LOW, HIGH
-        if i == 'awg_trig':
-            await cww.genwaveform(awg[i],['Readout_Q'],[5])
-            await cww.couldRun(awg[i])
-            await awg[i].write('TRIGg:SOUR %s'%'INT')   
-            await awg[i].write('TRIGGER:INTERVAL %f'%260e-6) 
-            for m in range(8):
-                await awg[i].write('SOUR%d:TINP %s'%((m+1),'ITR'))
+        # if i == 'awg_trig':
+        #     await cww.genwaveform(awg[i],['Readout_Q'],[5])
+        #     await cww.couldRun(measure,awg[i])
+        #     await awg[i].write('TRIGg:SOUR %s'%'INT')   
+        #     await awg[i].write('TRIGGER:INTERVAL %f'%260e-6) 
+        #     for m in range(8):
+        #         await awg[i].write('SOUR%d:TINP %s'%((m+1),'ITR'))
 
 ################################################################################
 # AWG同步
@@ -264,7 +313,7 @@ async def awgSync(measure):
     wf = WF(t_list)
     awg_list = measure.awg
     for i in awg_list:
-        wait = 'ITR' if awg_list[i] == awg_list['awg_trig'] else 'BTR'
+        wait = 'ATR' if awg_list[i] == awg_list['awg_trig'] else 'ATR'
         await awg_list[i].create_waveform(name=''.join((i,'_sync1')),length=len(measure.t_list),format=None)
         await awg_list[i].create_sequence(name=''.join((i,'_syncSeq')),steps=3,tracks=1)
         height,t_end,width = [1],[50000],[2000]
@@ -302,7 +351,7 @@ def voltTophi(qubit,bias,distance=0,freq=0):
 ################################################################################
 
 async def resn(f_cavity):
-    f_lo = f_cavity.max() + 70e6
+    f_lo = f_cavity.max() + 50e6
     delta =  f_lo - f_cavity 
     n = len(f_cavity)
     return f_lo, delta, n
@@ -332,7 +381,7 @@ async def dcManage(measure,dcstate={},readstate=[],calimatrix=None,qnum=10,reada
         f_lo, delta, n = await resn(np.array(fread))
         measure.n, measure.delta, measure.f_lo = n, delta, f_lo
         await cww.modulation_read(measure,delta,readlen=measure.readlen)
-        await cww.couldRun(measure.awg['awgread'])
+        await cww.couldRun(measure,measure.awg['awgread'])
     current = matrix.I * np.mat(bias).T
     for i,j in enumerate(measure.freqall):
         await measure.dc[j].DC(round(current[i,0],3))
@@ -394,14 +443,21 @@ async def exManage(measure,exstate=[],qnum=10):
     return delta_ex
 
 async def zManage(measure,dcstate={},calimatrix=None,qnum=10):
+
     qubits = measure.qubits
+    if qnum < 10:
+        qubits = {}
+        for i in measure.qubits:
+            if i in dcstate:
+                qubits[i] = measure.qubits[i]
+    #     qubits = {i:qubits[i] for i in qubits}
     matrix = np.mat(np.eye(qnum)) if np.all(calimatrix) == None else np.mat(calimatrix)
     bias = [0] * qnum
     for i,j in enumerate(qubits):
         bias[i] = dcstate[j] if j in dcstate else 0
         
     current = matrix.I * np.mat(bias).T
-    current = {f'q{i+1}':current[i,0] for i in range(qnum)}
+    current = {j:current[i,0] for i,j in enumerate(qubits)}
     return current
 
 ################################################################################
@@ -427,7 +483,7 @@ async def executeEXseq(measure,update_seq,len_data,comwave,exstate=[],readseq=Tr
             task_ready = update_seq(qubit,measure,kind=kind,**paras)
             # task1.append(task_ready)
             task1[taskname] = task_ready
-        task_manageawg = cww.awgchmanage(awg,kind,qubit.inst['ex_ch'])
+        task_manageawg = cww.awgchmanage(measure,awg,kind,qubit.inst['ex_ch'])
         # task2.append(task_manageawg)
         task2[taskname] = task_manageawg
     return [task1,task2]
@@ -442,7 +498,7 @@ async def executeZseq(measure,update_seq,len_data,comwave,dcstate={},calimatrix=
     task1, task2, namelist, awglist = {}, {}, [], []
     for i in dcstate:
         qubit = bit[i]
-        taskname = ''.join((qubit.inst['ex_awg'],'_ch',str(qubit.inst['z_ch'][0])))
+        taskname = ''.join((qubit.inst['z_awg'],'_ch',str(qubit.inst['z_ch'][0])))
         # kind = ''.join((qubit.inst['z_awg'],qubit.q_name,'_z'))
         kind = ''.join((qubit.q_name,'_z'))
         awg = measure.awg[qubit.inst['z_awg']]
@@ -454,7 +510,7 @@ async def executeZseq(measure,update_seq,len_data,comwave,dcstate={},calimatrix=
             #     task_ready = update_seq(qubit,measure,kind,volt=current[i],**paras)
             # task1.append(task_ready)
             task1[taskname] = task_ready
-        task_manageawg = cww.awgchmanage(awg,kind,qubit.inst['z_ch'])
+        task_manageawg = cww.awgchmanage(measure,awg,kind,qubit.inst['z_ch'])
         # task2.append(task_manageawg)
         task2[taskname] = task_manageawg
     return [task1,task2]
@@ -475,17 +531,17 @@ async def executeEXwave(measure,update_wave,exstate=[],output=True,**paras):
         namelist = [f'ch{i}' for i in qubit.inst['ex_ch']]
         chlist = qubit.inst['ex_ch']
         awg = measure.awg[qubit.inst['ex_awg']]
+        # pulselist = await cww.funcarg(update_wave,qubit,**paras)
         pulselist = await cww.funcarg(update_wave,qubit,**paras)
-        pulselist = await cww.funcarg(update_wave,qubit,**paras)
-        task_ready = cww.writeWave(awg,name=namelist,pulse=pulselist)
+        task_ready = cww.writeWave(measure,awg,name=namelist,pulse=pulselist)
         # task1.append(task_ready)
         task1[taskname] = task_ready
         if output:
-            task_manageawg = cww.couldRun(awg,chlist,namelist)
+            task_manageawg = cww.couldRun(measure,awg,chlist,namelist)
             # task2.append(task_manageawg)
             task2[taskname] = task_manageawg
         else:
-            task_manageawg = cww.couldRun(awg)
+            task_manageawg = cww.couldRun(measure,awg)
             # task2.append(task_manageawg)
             task2[taskname] = task_manageawg
     return [task1,task2]
@@ -494,29 +550,30 @@ async def executeEXwave(measure,update_wave,exstate=[],output=True,**paras):
 # 执行z并行处理
 ################################################################################
 
-async def executeZwave(measure,update_wave,dcstate={},calimatrix=None,output=True,**paras):
-    current = await zManage(measure,dcstate=dcstate,calimatrix=calimatrix)
-    # print(current)
+async def executeZwave(measure,update_wave,dcstate={},qnum=10,calimatrix=None,output=True,args='volt',**paras):
+    current = await zManage(measure,dcstate=dcstate,calimatrix=calimatrix,qnum=qnum)
     bit = measure.qubits
     task1, task2, awglist = {}, {}, []
     for i in current:
         qubit = bit[i]
+        # print(qubit.q_name)
         taskname = ''.join((qubit.inst['z_awg'],'_ch',str(qubit.inst['z_ch'][0])))
         zname, zch = [f'ch{i}' for i in qubit.inst['z_ch']], qubit.inst['z_ch']
         awg = measure.awg[qubit.inst['z_awg']]
-        if 'volt' in paras:
-            pulselist = await cww.funcarg(update_wave,qubit,**paras)
-        else:
-            pulselist = await cww.funcarg(update_wave,qubit,volt=current[i],**paras)
-        task_ready = cww.writeWave(awg=awg,name=zname,pulse=pulselist)
+        # if 'volt' in paras:
+        #     pulselist = await cww.funcarg(update_wave,qubit,**paras)
+        # else:
+        paras[args] = current[i]
+        pulselist = await cww.funcarg(update_wave,qubit,**paras)
+        task_ready = cww.writeWave(measure,awg=awg,name=zname,pulse=pulselist)
         # task1.append(task_ready)
         task1[taskname] = task_ready
         if output:
-            task_manageawg = cww.couldRun(awg,zch,zname)
+            task_manageawg = cww.couldRun(measure,awg,zch,zname)
             # task2.append(task_manageawg)
             task2[taskname] = task_manageawg
         else:
-            task_manageawg = cww.couldRun(awg)
+            task_manageawg = cww.couldRun(measure,awg)
             # task2.append(task_manageawg)
             task2[taskname] = task_manageawg
     return [task1,task2]
@@ -550,7 +607,7 @@ async def S21(qubit,measure,modulation=False,f_lo=None,f=None):
         delta, n = measure.delta, measure.n
     if modulation:
         await cww.modulation_read(measure,delta,readlen=measure.readlen)
-    await cww.couldRun(measure.awg['awgread'])
+    await cww.couldRun(measure,measure.awg['awgread'])
     await measure.psg['psg_lo'].setValue('Output','ON')
     if f is not None:
         freq = f
@@ -647,9 +704,9 @@ async def S21vsFlux_awgoffset(qubit,measure,current,calimatrix,modulation=False)
     await cww.genwaveform(awg,zname,qubit.inst['z_ch'])
     await dcManage(measure,dcstate={},readstate=[f'q{i+1}' for i in range(10)],calimatrix=calimatrix)
     for i in current:
-        pulse = await cww.funcarg(cww.zWave,qubit,pi_len=5000e-9,offset=i,shift=-3000e-9)
-        await cww.writeWave(awg,zname,pulse,mark=False)
-        await cww.couldRun(awg)
+        pulse = await cww.funcarg(cww.zWave,qubit,pi_len=5000e-9,offset=i,volt=0,shift=-3000e-9)
+        await cww.writeWave(measure,awg,zname,pulse,mark=False)
+        await cww.couldRun(measure,awg)
         job = Job(S21, (qubit,measure,modulation,measure.f_lo),auto_save=False, no_bar=True)
         f_s21, s_s21 = await job.done()
         n = np.shape(s_s21)[1]
@@ -664,7 +721,7 @@ async def S21vsPower(qubit,measure,att,com='com8'):
     await dcManage(measure,dcstate={},readstate=[qubit.q_name],calimatrix=None)
     for i in att:
         # await measure.attinst['com8'].set_att(i)
-        measure.readamp[(eval(qubit.q_name[1:])-1)] = i
+        measure.readamp[0] = i
         await cww.modulation_read(measure,measure.delta,readlen=2000)
         job = Job(S21, (qubit,measure,False,measure.f_lo),auto_save=False, no_bar=True)
         f_s21, s_s21 = await job.done()
@@ -720,8 +777,9 @@ async def specbias(qubit,measure,ftarget,bias,modulation=False):
 ################################################################################
 
 async def spec2d(qubit,measure,freq,calimatrix,modulation=False):
-    current = np.linspace(-qubit.T_bias[0]*0.35,qubit.T_bias[0]*0.35,36) + qubit.T_bias[1] 
-    await dcManage(measure,dcstate={},readstate=[f'q{i+1}' for i in range(10)],calimatrix=calimatrix)
+    current = np.linspace(-qubit.T_bias[0]*0.31,qubit.T_bias[0]*0.31,32) + qubit.T_bias[1] 
+    # await dcManage(measure,dcstate={},readstate=[f'q{i+1}' for i in range(10)],calimatrix=calimatrix)
+    await dcManage(measure,dcstate={},readstate=[qubit.q_name],calimatrix=calimatrix)
     for i in current:
         await dcManage(measure,dcstate={qubit.q_name:i},readstate=None,calimatrix=calimatrix)
         # await measure.dc[qubit.q_name].DC(i)
@@ -734,8 +792,8 @@ async def spec2d(qubit,measure,freq,calimatrix,modulation=False):
 # Spec2d_awg
 ################################################################################
 
-async def spec2d_awg(qubit,measure,freq,calimatrix,modulation=False):
-    current = np.linspace(-0.8,0.8,41)
+async def spec2d_awg(qubit,measure,current,freq,calimatrix,modulation=False):
+    
     # namelist = [f'ch{i}' for i in qubit.inst['z_ch']]
     # chlist = qubit.inst['z_ch']
     # z_awg = measure.awg[qubit.inst['z_awg']]
@@ -743,20 +801,21 @@ async def spec2d_awg(qubit,measure,freq,calimatrix,modulation=False):
     #         calimatrix=calimatrix,pi_len=0/1e9,shift=100e-9)
     # concurrence(task)
 
-    # dcstate = {i: round(measure.qubits[i].T_bias[1]-measure.qubits[i].T_bias[0]/5,3) for i in measure.qubits }
-    # await dcManage(measure,dcstate=dcstate,readstate=[],calimatrix=None)
-    # res = await again(qubit,measure,False,measure.f_lo)
+    dcstate = {i: measure.qubits[i].T_bias[1] for i in measure.qubits }
+    await dcManage(measure,dcstate=dcstate,readstate=[qubit.q_name],calimatrix=None)
+    res = await again(qubit,measure,False,measure.f_lo)
     
     
-    for i in current:
+    for j,i in enumerate(current):
+        output = True if j== 0 else False
         task = await executeZwave(measure,cww.zWave,dcstate={qubit.q_name:i},\
-            calimatrix=calimatrix,output=False,pi_len=27000/1e9,shift=100e-9)
+            calimatrix=calimatrix,output=output,during=27000/1e9,shift=300e-9)
         concurrence(task)
         # flux = await zManage(measure,dcstate={qubit.q_name:i},calimatrix=calimatrix)
         # pulselist = await cww.funcarg(cww.zWave,qubit,pi_len=27000e-9,volt=flux[qubit.q_name],shift=100e-9)
         # # pulselist = await cww.funcarg(cww.rabiWave,qubit,pi_len=27000e-9,amp=flux[qubit.q_name])
-        # await cww.writeWave(z_awg,name=namelist,pulse=pulselist[:1])
-        # await cww.couldRun(z_awg,chlist,namelist)
+        # await cww.writeWave(measure,z_awg,name=namelist,pulse=pulselist[:1])
+        # await cww.couldRun(measure,z_awg,chlist,namelist)
         job = Job(singlespec, (qubit,measure,freq,modulation,measure.f_lo,False),auto_save=False,max=len(freq))
         f_ss, s_ss = await job.done()
         n = np.shape(s_ss)[1]
@@ -767,12 +826,12 @@ async def spec2d_awg(qubit,measure,freq,calimatrix,modulation=False):
 ################################################################################
 
 async def rabi(measure,amp,arg='amp',exstate=[]):
-    await cww.couldRun(measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
+    await cww.couldRun(measure,measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
     # qubit = measure.qubits[exstate[0]]
     # namelist = [f'ch{i}' for i in qubit.inst['ex_ch']]
     # chlist = qubit.inst['ex_ch']
     # awg_ex = measure.awg[qubit.inst['ex_awg']]
-    # await cww.couldRun(awg_ex,chlist,namelist)
+    # await cww.couldRun(measure,awg_ex,chlist,namelist)
 
     await measure.psg['psg_lo'].setValue('Output','ON')
     
@@ -796,12 +855,46 @@ async def rabi(measure,amp,arg='amp',exstate=[]):
 ################################################################################
 
 async def rabi_seq(measure,amp,arg='amp',exstate=[],comwave=True,readseq=True,mode='vbroadcast'):
-    await cww.openandcloseAwg(measure,'OFF')
+    # await cww.openandcloseAwg(measure,'OFF')
     x = amp if arg == 'amp' else amp/1e9
     len_data, t = len(amp), np.array([amp]*measure.n).T
     task = await executeEXseq(measure,cww.Rabi_sequence,len_data,comwave,exstate,readseq,mode,v_or_t=x,arg=arg)
     concurrence(task)
-    await cww.openandcloseAwg(measure,'ON')
+    # await cww.openandcloseAwg(measure,'ON')
+
+    await measure.psg['psg_lo'].setValue('Output','ON')
+    x = amp if mode == 'hbroadcast' else t
+
+    if mode == 'hbroadcast':
+        for i in x:
+            ch_A, ch_B, I, Q = await measure.ats.getIQ()
+            # time.sleep(0.5)
+            Am, Bm = ch_A.mean(axis=0),ch_B.mean(axis=0)
+            # theta0 = np.angle(Am) - np.angle(Bm)
+            # Bm *= np.exp(1j*theta0)
+            s = Am + 1j*Bm
+            n = np.shape(s)[-1]
+            yield [i]*n, s - measure.base
+    if mode == 'vbroadcast':
+        for i in range(300):
+            ch_A, ch_B, I, Q = await measure.ats.getIQ()
+            Am, Bm = ch_A[1:len_data+1,:],ch_B[1:len_data+1,:]
+            # theta0 = np.angle(Am) - np.angle(Bm)
+            # Bm *= np.exp(1j*theta0)
+            s = Am + 1j*Bm
+            yield x, s - measure.base
+
+################################################################################
+# Rabi2_seq
+################################################################################
+
+async def rabi2_seq(measure,amp,arg='amp',exstate=[],comwave=True,readseq=True,mode='vbroadcast'):
+    # await cww.openandcloseAwg(measure,'OFF')
+    x = amp if arg == 'amp' else amp/1e9
+    len_data, t = len(amp), np.array([amp]*measure.n).T
+    task = await executeEXseq(measure,cww.Rabi2_sequence,len_data,comwave,exstate,readseq,mode,v_or_t=x,arg=arg)
+    concurrence(task)
+    # await cww.openandcloseAwg(measure,'ON')
 
     await measure.psg['psg_lo'].setValue('Output','ON')
     x = amp if mode == 'hbroadcast' else t
@@ -901,15 +994,15 @@ async def Ramsey_seq(measure,t_Ramsey,exstate=[],comwave=True,readseq=True,mode=
             # Bm *= np.exp(1j*theta0)
             s = Am + 1j*Bm
             yield x, s - measure.base
-
+    measure.qubits[exstate[0]].replace(nwave=1,seqtype='PDD',detune=2e6)
 ################################################################################
 # SpinEcho_seq
 ################################################################################
 
-async def SpinEcho_seq(measure,t_Ramsey,exstate=[],comwave=True):
+async def SpinEcho_seq(measure,t_Ramsey,exstate=[],comwave=True,readseq=True,mode='vbroadcast'):
 
     len_data, t = len(t_Ramsey), np.array([t_Ramsey]*measure.n).T
-    task = await executeEXseq(measure,cww.Coherence_sequence,len_data,comwave,exstate=exstate,v_or_t=t_Ramsey,arg='t_run')
+    task = await executeEXseq(measure,cww.Coherence_sequence,len_data,comwave,exstate,readseq,mode,v_or_t=t_Ramsey/1e9,arg='t_run')
     concurrence(task)
     await measure.psg['psg_lo'].setValue('Output','ON')
     
@@ -930,7 +1023,7 @@ async def readOp(measure,exstate=[]):
     task = await executeEXwave(measure,cww.rabiWave,exstate=exstate)
     concurrence(task)
 
-    await cww.couldRun(measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
+    await cww.couldRun(measure,measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
     for j, i in enumerate(['OFF','ON']):
         for k in exstate:
             await measure.psg[measure.qubits[k].inst['ex_lo']].setValue('Output',i)
@@ -939,26 +1032,22 @@ async def readOp(measure,exstate=[]):
         n = np.shape(s_s21)[1]
         yield [j]*n, f_s21, s_s21
 
-# async def readOp(measure,exstate=[]):
+################################################################################
+# 优化读出点占比
+################################################################################
 
+async def readOpweight(measure,exstate=[]):
 
-#     qubit = measure.qubits[exstate[0]]
-#     namelist = [f'ch{i}' for i in qubit.inst['ex_ch']]
-#     chlist = qubit.inst['ex_ch']
-#     awg_ex = measure.awg[qubit.inst['ex_awg']]
+    task = await executeEXwave(measure,cww.rabiWave,exstate=exstate)
+    concurrence(task)
 
-#     await cww.genwaveform(awg_ex,namelist,chlist)
-#     pulselist = await cww.funcarg(cww.rabiWave,qubit)
-#     await cww.writeWave(awg_ex,name=namelist,pulse=pulselist)
-#     await cww.couldRun(awg_ex,chlist)
-#     await cww.couldRun(measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
-#     for j, i in enumerate(['OFF','ON']):
-#         await measure.psg[qubit.inst['ex_lo']].setValue('Output',i)
-#         job = Job(S21, (qubit,measure,False,measure.f_lo),auto_save=False,max=121)
-#         f_s21, s_s21 = await job.done()
-#         n = np.shape(s_s21)[1]
-#         yield [j]*n, f_s21, s_s21
+    await cww.couldRun(measure,measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
 
+    for j, i in enumerate(['OFF','ON']):
+        for k in exstate:
+            await measure.psg[measure.qubits[k].inst['ex_lo']].setValue('Output',i)
+        chA, chB, ch_I, ch_Q = await measure.ats.getTraces()
+        yield chA + 1j*chB
 
 ################################################################################
 # 对比度
@@ -993,10 +1082,23 @@ async def visibility(n,s0,s1):
 
 async def threshHold(measure,exstate=[]):
     qubit = measure.qubits[exstate[0]]
+    ex_name, exch = [f'ch{i}' for i in qubit.inst['ex_ch']], qubit.inst['ex_ch']
+    ex_awg = measure.awg[qubit.inst['ex_awg']]
+    task = await executeEXwave(measure,cww.rabiWave,exstate=exstate)
+    concurrence(task)
     await cww.ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=3000)
-    for j, i in enumerate(['OFF','ON']):
-        await measure.psg[qubit.inst['ex_lo']].setValue('Output',i)
-        time.sleep(0.5)
+    for j, i in enumerate(['OFF','ON','ON2']):
+        if i != 'ON2':
+            await measure.psg[qubit.inst['ex_lo']].setValue('Output',i)
+            time.sleep(0.5)
+        # else:
+        #     pulse_rabi2 = await cww.funcarg(cww.singleQgate,qubit,pi_len=qubit.pi_len2,amp=qubit.amp2,\
+        #         delta_ex=(qubit.delta_ex + qubit.alpha))
+        #     pulse_pi1 = await cww.funcarg(cww.singleQgate,qubit,shift=qubit.envelopename[1]*qubit.pi_len2 + 10e-9)
+        #     pulse = np.array(pulse_pi1) + np.array(pulse_rabi2)
+        #     await cww.writeWave(measure,ex_awg,ex_name,pulse,mark=False)
+        #     await cww.couldRun(measure,ex_awg,exch)
+        
         ch_A, ch_B, I, Q = await measure.ats.getIQ(hilbert=True)
         Am, Bm = ch_A,ch_B
         # theta0 = np.angle(Am) - np.angle(Bm)
@@ -1016,7 +1118,7 @@ async def readpowerOpt(measure,which,readamp):
     for k in readamp:
         measure.readamp = [k]
         await cww.modulation_read(measure,measure.delta,readlen=measure.readlen,repeats=5000)
-        await cww.couldRun(measure.awg['awgread'])
+        await cww.couldRun(measure,measure.awg['awgread'])
         
         ch_A, ch_B, I, Q = await measure.ats.getIQ(hilbert=False)
         Am, Bm = ch_A,ch_B
@@ -1057,8 +1159,8 @@ async def readpowerOpt(measure,which,readamp):
 ################################################################################
     
 async def AllXYdragdetune(measure,which,exstate=[]):
-    await cww.couldRun(measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
-    coef = np.linspace(-3,3,61)
+    await cww.couldRun(measure,measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
+    coef = np.linspace(-2,2,41)
 
     qubit = measure.qubits[exstate[0]]
     alpha = qubit.alpha*2*np.pi
@@ -1071,14 +1173,14 @@ async def AllXYdragdetune(measure,which,exstate=[]):
     
     await measure.psg['psg_lo'].setValue('Output','ON')
     await measure.psg[qubit.inst['ex_lo']].setValue('Output','ON')
-    await cww.couldRun(ex_awg,namelist=ex_name,chlist=ex_ch)
+    await cww.couldRun(measure,ex_awg,namelist=ex_name,chlist=ex_ch)
     for j in [['X','Yhalf'],['Y','Xhalf']]:
         for i in coef:
             pulse1 = await cww.funcarg(cww.singleQgate,qubit,axis=j[0],DRAGScaling=i/alpha,shift=(qubit.pi_len+5e-9))
             pulse2 = await cww.funcarg(cww.singleQgate,qubit,axis=j[1],DRAGScaling=i/alpha)
             pulse = np.array(pulse1) + np.array(pulse2)
-            await cww.writeWave(ex_awg,ex_name,pulse)
-            await cww.couldRun(ex_awg)
+            await cww.writeWave(measure,ex_awg,ex_name,pulse)
+            await cww.couldRun(measure,ex_awg)
             # ch_A, ch_B, I, Q = await measure.ats.getIQ(hilbert=True)
             # Am, Bm = ch_A[:,0],ch_B[:,0]
             # theta0 = np.angle(Am) - np.angle(Bm)
@@ -1124,7 +1226,7 @@ async def T1_seq(measure,t_T1,exstate=[],comwave=True):
 async def singleacStark(measure,t_shift,power=1,exstate=[],comwave=True):
 
     pulselist = await cww.ac_stark_wave(measure,power)
-    await cww.writeWave(measure.awg['awgread'],['Readout_I','Readout_Q'],pulselist,False,mark=True)
+    await cww.writeWave(measure,measure.awg['awgread'],['Readout_I','Readout_Q'],pulselist,False,mark=False)
     job = Job(rabi_seq, (measure,t_shift,'shift',exstate,comwave,True,'vbroadcast'), max=300,avg=True)
     # job = Job(T1_seq, (measure,t_shift,exstate,comwave), tags=(exstate+['acstark']), max=300,avg=True)
     t_t, s_t = await job.done()
@@ -1135,7 +1237,7 @@ async def acStark(measure,t_T1,power,exstate=[]):
     freq = np.linspace(-260,40,51)*1e6 + qubit.f_ex 
     f_m = qubit.f_ex
     # await cww.ac_stark_wave(measure)
-    # await cww.couldRun(measure.awg['awgread'])
+    # await cww.couldRun(measure,measure.awg['awgread'])
 
     for i,j in enumerate(freq):
         # await measure.psg[qubit.inst['ex_lo']].setValue('Frequency',j)
@@ -1158,7 +1260,7 @@ async def singleNum(measure,power,comwave=True):
     await cww.gen_packSeq(measure,kind,awg,['I','Q'],len_data,readseq=False)
     if comwave:
         await cww.acstarkSequence(measure,kind=kind,v_or_t=power,arg='power')
-    await cww.awgchmanage(awg,kind,[1,5])
+    await cww.awgchmanage(measure,awg,kind,[1,5])
 
     await measure.psg['psg_lo'].setValue('Output','ON')
     await measure.psg['psg_ex1'].setValue('Output','ON')
@@ -1194,7 +1296,7 @@ async def photonNum(measure,power,end,exstate=[]):
 async def singleZpulse(measure,t_shift,exstate=[],comwave=True,updatez=True):
     
     if updatez:
-        task = await executeZwave(measure,cww.zWave,dcstate={exstate[0]:0.05},output=True,pi_len=2000/1e9,shift=3000e-9)
+        task = await executeZwave(measure,cww.zWave,dcstate={exstate[0]:0.1},output=True,during=50/1e9,shift=3000e-9)
         concurrence(task)
 
     job = Job(rabi_seq, (measure,t_shift,'shift',exstate,comwave,True,'vbroadcast'), max=300,avg=True)
@@ -1205,28 +1307,176 @@ async def zPulse(measure,t_T1,exstate=[]):
     qubit = measure.qubits[exstate[0]]
     zname, zch = [f'ch{i}' for i in qubit.inst['z_ch']], qubit.inst['z_ch']
     z_awg = measure.awg[qubit.inst['z_awg']]
-    pulse1 = await cww.funcarg(cww.zWave,qubit,pi_len=2000/1e9,volt=0.2,shift=3000e-9)
+    pulse1 = await cww.funcarg(cww.zWave,qubit,during=2000/1e9,volt=0.2,shift=3000e-9)
     volt = np.linspace(-0.2,0.1,40)
     for i,j in enumerate(volt):
-        pulse2 = await cww.funcarg(cww.zWave,qubit,pi_len=4000/1e9,volt=j,shift=1500e-9)
+        pulse2 = await cww.funcarg(cww.zWave,qubit,during=4000/1e9,volt=j,shift=1500e-9)
         pulse = np.array(pulse1) + np.array(pulse2)
-        await cww.writeWave(z_awg,zname,pulse,mark=False)
-        await cww.couldRun(z_awg,zch,zname)
+        await cww.writeWave(measure,z_awg,zname,pulse,mark=False)
+        await cww.couldRun(measure,z_awg,zch,zname)
         comwave = True if i == 0 else False
         job = Job(singleZpulse, (measure,t_T1,exstate,comwave,False), tags=exstate, no_bar=True,auto_save=False)
         t_shift, s_z = await job.done()
         yield [j]*measure.n, t_shift, s_z
 
 
-async def singleZ(measure,t_T1,which=0,exstate=[]):
+# async def singleZ(measure,t_T1,which=0,exstate=[]):
+#     qubit = measure.qubits[exstate[0]]
+#     exname, exch = [f'ch{i}' for i in qubit.inst['ex_ch']], qubit.inst['ex_ch']
+#     ex_awg = measure.awg[qubit.inst['ex_awg']]
+#     await cww.couldRun(measure,ex_awg,exch,exname)
+#     for k in t_T1:
+#         pulselist = await cww.funcarg(cww.rabiWave,qubit,shift=k/1e9)
+#         await cww.writeWave(measure,ex_awg,name=exname,pulse=pulselist)
+#         await cww.couldRun(measure,ex_awg)
+#         ch_A, ch_B, I, Q = await measure.ats.getIQ()
+#         Am, Bm = ch_A,ch_B
+#         # theta0 = np.angle(Am) - np.angle(Bm)
+#         # Bm *= np.exp(1j*theta0)
+#         ss = Am + 1j*Bm
+#         # d = list(zip(np.real(ss),np.imag(ss)))
+#         d = [list(zip(np.real(ss)[:,i],np.imag(ss)[:,i])) for i in range(np.shape(ss)[1])]
+#         y = [measure.predict[j](d[i]) for i, j in enumerate(measure.qubitToread)]
+#         pop = np.count_nonzero(y,axis=1)/np.shape(y)[1]
+#         pop = np.array([pop[i] if j == 1 else 1-pop[i] for i, j in enumerate(which)])
+#         yield [k], pop
+
+# async def zPulse_pop(measure,t_T1,which=0,exstate=[]):
+
+#     qubit = measure.qubits[exstate[0]]
+#     zname, zch = [f'ch{i}' for i in qubit.inst['z_ch']], qubit.inst['z_ch']
+#     z_awg = measure.awg[qubit.inst['z_awg']]
+#     pulse1 = await cww.funcarg(cww.zWave,qubit,pi_len=2000/1e9,volt=0.8,shift=3000e-9)
+#     await cww.couldRun(measure,z_awg,zch,zname)
+
+#     volt = np.linspace(-0.21,-0.01,51)
+#     await cww.ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=1000)
+#     for j in volt:
+#         pulse2 = await cww.funcarg(cww.zWave,qubit,pi_len=4000/1e9,volt=j,shift=1500e-9)
+#         pulse = np.array(pulse1) + np.array(pulse2)
+#         await cww.writeWave(measure,z_awg,zname,pulse,mark=False)
+#         await cww.couldRun(measure,z_awg)
+#         job = Job(singleZ,(measure,t_T1,which,exstate),max=len(t_T1))
+#         t, pop = await job.done()
+#         yield [j], t, pop
+
+async def singleZ(measure,volt,which=0,exstate=[]):
+    qubit = measure.qubits[exstate[0]]
+    zname, zch = [f'ch{i}' for i in qubit.inst['z_ch']], qubit.inst['z_ch']
+    z_awg = measure.awg[qubit.inst['z_awg']]
+    pulse1 = await cww.funcarg(cww.zWave,qubit,during=2000/1e9,volt=-0.8,shift=5000e-9)
+    await cww.couldRun(measure,z_awg,zch,zname)
+    
+    for k in volt:
+        pulse2 = await cww.funcarg(cww.zWave,qubit,during=5500/1e9,volt=k,shift=1500e-9)
+        # pulse = pulse1 + pulse2
+        pulse = np.array(pulse1) + np.array(pulse2)
+        await cww.writeWave(measure,z_awg,zname,pulse)
+        await cww.couldRun(measure,z_awg)
+        
+        ch_A, ch_B, I, Q = await measure.ats.getIQ(hilbert=True)
+        Am, Bm = ch_A,ch_B
+        # theta0 = np.angle(Am) - np.angle(Bm)
+        # Bm *= np.exp(1j*theta0)
+        ss = Am + 1j*Bm
+        # d = list(zip(np.real(ss),np.imag(ss)))
+        # d = [list(zip(np.real(ss)[:,i],np.imag(ss)[:,i])) for i in range(np.shape(ss)[1])]
+        # y = [measure.predict[j](d[i]) for i, j in enumerate(measure.qubitToread)]
+        # pop = np.count_nonzero(y,axis=1)/np.shape(y)[1]
+        # pop = np.array([pop[i] if which[j] == 1 else 1-pop[i] for i, j in enumerate(measure.qubitToread)])
+        pop = readPop(measure,ss)
+        yield [k], np.array(pop)[:,1]
+
+async def zPulse_pop(measure,t_T1,which=0,exstate=[]):
     qubit = measure.qubits[exstate[0]]
     exname, exch = [f'ch{i}' for i in qubit.inst['ex_ch']], qubit.inst['ex_ch']
     ex_awg = measure.awg[qubit.inst['ex_awg']]
-    await cww.couldRun(ex_awg,exch,exname)
-    for k in t_T1:
-        pulselist = await cww.funcarg(cww.rabiWave,qubit,shift=k/1e9)
-        await cww.writeWave(ex_awg,name=exname,pulse=pulselist)
-        await cww.couldRun(ex_awg)
+    await cww.couldRun(measure,ex_awg,exch,exname)
+    func = lambda t: (scipy.special.erf((t-5000)/2)+1)/2*0.8
+    sampleStep = 0.0008
+    volt_init = np.arange(-0.08,0.88,sampleStep)
+    length = len(volt_init)
+    # index = length//2
+    index = np.argmin(np.abs(volt_init-0)) if t_T1[0] == np.min(t_T1) else np.argmin(np.abs(volt_init-0.8))
+    start, end = volt_init[index]-40*sampleStep, volt_init[index]+40*sampleStep
+    volt = np.arange(start,end,sampleStep)
+    
+    
+    for i, j in enumerate(t_T1):
+        # print(index)
+        #res = np.zeros((length,1))
+        pop_m = np.zeros((length,1))
+        #res[int(index-(len(volt)-1)/2):int(index+(len(volt)-1)/2+1),0] = volt
+        pulselist = await cww.funcarg(cww.rabiWave,qubit,shift=j/1e9)
+        await cww.writeWave(measure,ex_awg,name=exname,pulse=pulselist)
+        await cww.couldRun(measure,ex_awg)
+        job = Job(singleZ,(measure,volt,which,exstate),max=len(volt))
+        v, pop = await job.done()
+        if len(volt) % 2 == 0:
+            pop_m[int(index-len(volt)//2):int(index+len(volt)//2),0] = pop[:,0]
+        else:
+            pop_m[int(index-len(volt)//2):int(index+len(volt)//2+1),0] = pop[:,0]
+        # v = v[:,0]
+        #print(index,volt)
+        if np.max(pop_m[:,0]) < 0.6:
+            v = func(t_T1[i+1])
+            index = np.argmin(np.abs(volt_init-v))
+            start, end = volt_init[index]-80*sampleStep, volt_init[index]+80*sampleStep
+            volt = np.arange(start,end,sampleStep)
+            if np.min(volt)<np.min(volt_init) or np.max(volt)>np.max(volt_init):
+                print(f'warning: too big or too min {np.min(volt),np.max(volt)}')
+                break
+            # if j > 4993:
+            #     index = np.argmin(np.abs(volt_init+0.8))
+            #     start, end = volt_init[index]-40*sampleStep, volt_init[index]+40*sampleStep
+            #     volt = np.arange(start,end,sampleStep)
+            #     # volt = np.arange(-0.04,0.04,sampleStep) - 0.8
+            #     # index = np.argmin(np.abs(volt_init+0.8))
+            # else:
+            #     index = np.argmin(np.abs(volt_init-0))
+            #     start, end = volt_init[index]-40*sampleStep, volt_init[index]+40*sampleStep
+            #     volt = np.arange(start,end,sampleStep)
+        else:
+            index = np.argmax(pop_m[:,0])
+        # index_v = np.argmax(pop[:,0])
+            start, end = volt_init[index]-10*sampleStep, volt_init[index]+10*sampleStep
+            if np.max(volt_init) < end:
+                print('warning: max too little')
+                end = np.max(volt_init)
+            if np.min(volt_init) > start:
+                print('warning: min too big')
+                start = np.min(volt_init)
+            volt = np.arange(start,end,sampleStep)
+        # if j >= 4950:
+        #     volt = volt_init
+        yield [j], volt_init.reshape(length,1), pop_m
+
+################################################################################
+# Z_Pulse_XY（Z与Readout时序矫正) population
+################################################################################
+
+async def zPulse_XY(measure,tdelay,t_int,tshift,which,caliparas,exstate=[]):
+    
+    qubit = measure.qubits[exstate[0]]
+    ex_name, exch = [f'ch{i}' for i in qubit.inst['ex_ch']], qubit.inst['ex_ch']
+    ex_awg = measure.awg[qubit.inst['ex_awg']]
+    
+    zname, zch = [f'ch{i}' for i in qubit.inst['z_ch']], qubit.inst['z_ch']
+    z_awg = measure.awg[qubit.inst['z_awg']]
+    await cww.couldRun(measure,z_awg,zch,zname)
+
+    pulse1 = await cww.funcarg(cww.singleQgate,qubit,axis='Xhalf',shift=tshift*1e-9)
+    pulse2 = await cww.funcarg(cww.singleQgate,qubit,axis='Yhalf',shift=(tshift*1e-9-t_int/1e9-qubit.pi_len))
+    pulse = np.array(pulse1) + np.array(pulse2)
+    await cww.writeWave(measure,ex_awg,ex_name,pulse)
+    await cww.couldRun(measure,ex_awg,exch,ex_name)
+    
+    for i in tdelay:
+
+        pulse = await cww.funcarg(cww.zWave,qubit,pi_len=2000/1e9,volt=0.8,shift=(tshift*1e-9+i*1e-9))
+        await cww.writeWave(measure,z_awg,zname,pulse,mark=False,caliparas=caliparas)
+        await cww.couldRun(measure,z_awg)
+
         ch_A, ch_B, I, Q = await measure.ats.getIQ()
         Am, Bm = ch_A,ch_B
         # theta0 = np.angle(Am) - np.angle(Bm)
@@ -1236,28 +1486,9 @@ async def singleZ(measure,t_T1,which=0,exstate=[]):
         d = [list(zip(np.real(ss)[:,i],np.imag(ss)[:,i])) for i in range(np.shape(ss)[1])]
         y = [measure.predict[j](d[i]) for i, j in enumerate(measure.qubitToread)]
         pop = np.count_nonzero(y,axis=1)/np.shape(y)[1]
-        pop = np.array([pop[i] if j == 1 else 1-pop[i] for i, j in enumerate(which)])
-        yield [k], pop
+        pop = np.array([pop[i] if which[j] == 1 else 1-pop[i] for i, j in enumerate(which)])
+        yield [i], pop  
 
-async def zPulse_pop(measure,t_T1,which=0,exstate=[]):
-
-    qubit = measure.qubits[exstate[0]]
-    zname, zch = [f'ch{i}' for i in qubit.inst['z_ch']], qubit.inst['z_ch']
-    z_awg = measure.awg[qubit.inst['z_awg']]
-    pulse1 = await cww.funcarg(cww.zWave,qubit,pi_len=2000/1e9,volt=0.2,shift=3000e-9)
-    await cww.couldRun(z_awg,zch,zname)
-
-    volt = np.linspace(-0.04,0.01,51)
-    await cww.ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=1000)
-    for j in volt:
-        pulse2 = await cww.funcarg(cww.zWave,qubit,pi_len=4000/1e9,volt=j,shift=1500e-9)
-        pulse = np.array(pulse1) + np.array(pulse2)
-        await cww.writeWave(z_awg,zname,pulse,mark=False)
-        await cww.couldRun(z_awg)
-        job = Job(singleZ,(measure,t_T1,which,exstate),max=len(t_T1))
-        t, pop = await job.done()
-        yield [j], t, pop
-        
 ################################################################################
 # 真空拉比
 ################################################################################
@@ -1268,51 +1499,50 @@ async def vRabi(measure,t_rabi,v_rabi,mode='vbroadcast',dcstate=[],exstate=[],im
     # zname, z_awg = qubit_ex.q_name+'_z', measure.awg[qubit_ex.inst['z_awg']]
     # await cw.create_wavelist(measure,zseqname,(z_awg,['step'],len(t_rabi),len(measure.t_list)))
     # await cw.genSeq(measure,z_awg,zseqname)
-    # await cw.awgchmanage(z_awg,zseqname,qubit_ex.inst['z_ch'])
+    # await cw.awgchmanage(measure,z_awg,zseqname,qubit_ex.inst['z_ch'])
     
     for i, j in enumerate(v_rabi):
 
         task_z = await executeZseq(measure,cww.Z_sequence,len_data,True,mode=mode,dcstate=dcstate,\
-            v_or_t=t_rabi/1e9,arg='pi_len',volt=j,delta_im=330e6,imAmp=imAmp)
+            v_or_t=t_rabi/1e9,arg='during',volt=j,delta_im=0e6,imAmp=imAmp)
         concurrence(task_z)
         comwave = True if i == 0 else False
-        numrepeat, avg, measure.repeat = (len(v_rabi),False,500) if mode == 'hbroadcast' else (300,True,500)
+        numrepeat, avg, measure.repeat = (len(v_rabi),False,500) if mode == 'hbroadcast' else (300,True,len_data)
         job = Job(rabi_seq, (measure,t_rabi,'shift',exstate,comwave,comwave,mode), tags=exstate, max=numrepeat,avg=avg, no_bar=True)
         t_t, s_t = await job.done()
         yield [j]*measure.n, t_t, s_t   
          
-# async def singleVrabi(measure,v_rabi,pi_len,mode,dcstate,exstate,imAmp=0):
-#     len_data, t = len(v_rabi), np.array([v_rabi]*measure.n).T
-#     await cww.openandcloseAwg(measure,'OFF')
+async def singleVrabi(measure,v_rabi,during,mode,dcstate,exstate,imAmp=0):
+    len_data, t = len(v_rabi), np.array([v_rabi]*measure.n).T
+    # await cww.openandcloseAwg(measure,'OFF')
 
-#     # await cww.funcarg(cww.rabiWave,qubit_ex,shift=(j+600)/1e9)
-#     # task_ex = await executeEXseq(measure,cww.Rabi_sequence,len_data,True,mode=mode,exstate=exstate,v_or_t=[pi_len]*len_data,arg='shift')
-#     task_z = await executeZseq(measure,cww.Z_sequence,len_data,True,mode=mode,dcstate=dcstate,\
-#         v_or_t=v_rabi,arg='volt',pi_len=pi_len,delta_im=330e6,imAmp=imAmp)
-#     # concurrence([{**task_ex[0],**task_z[0]},{**task_ex[1],**task_z[1]}])
-#     concurrence(task_z)
-#     await cww.openandcloseAwg(measure,'ON')
-#     await measure.psg['psg_lo'].setValue('Output','ON')
+    # await cww.funcarg(cww.rabiWave,qubit_ex,shift=(j+600)/1e9)
+    # task_ex = await executeEXseq(measure,cww.Rabi_sequence,len_data,True,mode=mode,exstate=exstate,v_or_t=[during]*len_data,arg='shift')
+    task_z = await executeZseq(measure,cww.Z_sequence,len_data,True,mode=mode,dcstate=dcstate,\
+        v_or_t=v_rabi,arg='volt',during=during,delta_im=0e6,imAmp=imAmp)
+    # concurrence([{**task_ex[0],**task_z[0]},{**task_ex[1],**task_z[1]}])
+    concurrence(task_z)
+    await measure.psg['psg_lo'].setValue('Output','ON')
     
-#     x = v_rabi if mode == 'hbroadcast' else t
+    x = v_rabi if mode == 'hbroadcast' else t
 
-#     if mode == 'hbroadcast':
-#         for i in x:
-#             ch_A, ch_B, I, Q = await measure.ats.getIQ()
-#             Am, Bm = ch_A.mean(axis=0),ch_B.mean(axis=0)
-#             # theta0 = np.angle(Am) - np.angle(Bm)
-#             # Bm *= np.exp(1j*theta0)
-#             s = Am + 1j*Bm
-#             n = np.shape(s)[-1]
-#             yield [i]*n, s - measure.base
-#     if mode == 'vbroadcast':
-#         for i in range(300):
-#             ch_A, ch_B, I, Q = await measure.ats.getIQ()
-#             Am, Bm = ch_A[1:len_data+1,:],ch_B[1:len_data+1,:]
-#             # theta0 = np.angle(Am) - np.angle(Bm)
-#             # Bm *= np.exp(1j*theta0)
-#             s = Am + 1j*Bm
-#             yield x, s - measure.base
+    if mode == 'hbroadcast':
+        for i in x:
+            ch_A, ch_B, I, Q = await measure.ats.getIQ()
+            Am, Bm = ch_A.mean(axis=0),ch_B.mean(axis=0)
+            # theta0 = np.angle(Am) - np.angle(Bm)
+            # Bm *= np.exp(1j*theta0)
+            s = Am + 1j*Bm
+            n = np.shape(s)[-1]
+            yield [i]*n, s - measure.base
+    if mode == 'vbroadcast':
+        for i in range(300):
+            ch_A, ch_B, I, Q = await measure.ats.getIQ()
+            Am, Bm = ch_A[1:len_data+1,:],ch_B[1:len_data+1,:]
+            # theta0 = np.angle(Am) - np.angle(Bm)
+            # Bm *= np.exp(1j*theta0)
+            s = Am + 1j*Bm
+            yield x, s - measure.base
 
 # async def vRabi(measure,t_rabi,v_rabi,mode='vbroadcast',dcstate=[],exstate=[],imAmp=0):
 #     # len_data = len(v_rabi)
@@ -1320,16 +1550,175 @@ async def vRabi(measure,t_rabi,v_rabi,mode='vbroadcast',dcstate=[],exstate=[],im
 #     namelist = [f'ch{i}' for i in qubit_ex.inst['ex_ch']]
 #     chlist = qubit_ex.inst['ex_ch']
 #     awg_ex = measure.awg[qubit_ex.inst['ex_awg']]
-#     await cww.couldRun(awg_ex,chlist,namelist)
+#     await cww.couldRun(measure,awg_ex,chlist,namelist)
 #     for i, j in enumerate(t_rabi):
-#         pulselist = await cww.funcarg(cww.rabiWave,qubit_ex,shift=j/1e9)
-#         await cww.writeWave(awg_ex,name=namelist,pulse=pulselist)
-#         await cww.couldRun(awg_ex)
+#         # pulselist = await cww.funcarg(cww.rabiWave,qubit_ex,shift=j/1e9)
+#         # await cww.writeWave(measure,awg_ex,name=namelist,pulse=pulselist)
+#         # await cww.couldRun(measure,awg_ex)
+#         output = True if i == 0 else False
+#         task_ex = await executeEXwave(measure,cww.rabiWave,exstate=exstate,output=output,shift=j/1e9)
+#         task_z = await executeZwave(measure,cww.zWave,dcstate=dcstate,output=output,pi_len=j/1e9)
+#         concurrence([{**task_ex[0],**task_z[0]},{**task_ex[1],**task_z[1]}])
 #         # comwave = True if i == 0 else False
-#         numrepeat, avg, measure.repeat = (len(v_rabi),False,500) if mode == 'hbroadcast' else (300,True,500)
-#         job = Job(singleVrabi, (measure,v_rabi,j/1e9,mode,dcstate,exstate,imAmp), tags=exstate, max=numrepeat,avg=avg, no_bar=True)
+#         numrepeat, avg, measure.repeat = (len(v_rabi),False,500) if mode == 'hbroadcast' else (300,True,len_data)
+#         job = Job(singleVrabi, (measure,v_rabi,j/1e9,mode,exstate,exstate,imAmp), tags=exstate, max=numrepeat,avg=avg, no_bar=True)
 #         t_t, s_t = await job.done()
 #         yield [j]*measure.n, t_t, s_t    
+
+################################################################################
+# 邻近比特zPulse矫正时序
+################################################################################
+
+async def zzTiming(measure,t_delay,exstate=[],dcstate=[]):
+
+    await cww.couldRun(measure,measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
+    qubit_ex = measure.qubits[exstate[0]]
+    exname = [f'ch{i}' for i in qubit_ex.inst['ex_ch']]
+    exch = qubit.inst['ex_ch']
+    awg_ex = measure.awg[qubit_ex.inst['ex_awg']]
+    awg_ex_z = measure.awg[qubit_ex.inst['z_awg']]
+    qubit_z = measure.qubits[dcstate[0]]
+    zname = [f'ch{i}' for i in qubit_z.inst['z_ch']]
+    zch = qubit.inst['z_ch']
+    awg_z = measure.awg[qubit_z.inst['z_awg']]
+
+    await measure.psg['psg_lo'].setValue('Output','ON')
+    pulse_z = await cww.funcarg(cww.zWave,qubit,pi_len=50/1e9,shift=1000e-9)
+    await cww.writeWave(measure,awg_z,zname,pulse_z)
+
+
+    for i in t_delay:
+        # pulselist = await cww.funcarg(cww.coherenceWave,qubit,t_delay=i/1e9)
+        # await cww.writeWave(measure,awg_ex,name=namelist,pulse=pulselist)
+        # await cww.couldRun(measure,awg_ex)
+        task = await executeEXwave(measure,cww.coherenceWave,exstate=exstate,t_delay=i/1e9)
+        concurrence(task)
+        ch_A, ch_B, I, Q = await measure.ats.getIQ()
+        Am, Bm = ch_A.mean(axis=0),ch_B.mean(axis=0)
+        # Im, Qm = I.mean(axis=0), Q.mean(axis=0)
+        # sq = Im + 1j*Qm
+        # theta0 = np.angle(Am) - np.angle(Bm)
+        # Bm *= np.exp(1j*theta0)
+        s = Am + 1j*Bm
+        yield [i], s-measure.base
+
+################################################################################
+# 纵场调制
+################################################################################
+
+async def vModulation(measure,t_rabi,v_rabi,mode='vbroadcast',dcstate=[],exstate=[],calimatrix=None):
+    len_data = len(t_rabi)
+    # qubit_z, qubit_ex = measure.qubits[dcstate[0]], measure.qubits[exstate[0]]
+    # zname, z_awg = qubit_ex.q_name+'_z', measure.awg[qubit_ex.inst['z_awg']]
+    # await cw.create_wavelist(measure,zseqname,(z_awg,['step'],len(t_rabi),len(measure.t_list)))
+    # await cw.genSeq(measure,z_awg,zseqname)
+    # await cw.awgchmanage(measure,z_awg,zseqname,qubit_ex.inst['z_ch'])
+    dc = {f'q{i+1}':0 for i in range(10)}
+    for i, j in enumerate(v_rabi):
+        dc[dcstate[0]] = j
+        current = await zManage(measure,dcstate=dc,calimatrix=calimatrix)
+        task_zz = await executeZseq(measure,cww.Z_sequence_im,len_data,True,mode=mode,dcstate=dcstate,\
+            v_or_t=t_rabi/1e9,arg='during',delta_im=120e6,imAmp=current[dcstate[0]])
+        task_zex = await executeZseq(measure,cww.Z_sequence_im,len_data,True,mode=mode,dcstate=exstate,\
+            v_or_t=t_rabi/1e9,arg='during',delta_im=120e6,imAmp=current[exstate[0]])
+        concurrence([{**task_zz[0],**task_zex[0]},{**task_zz[1],**task_zex[1]}])
+        # concurrence(task_zz)
+        comwave = True if i == 0 else False
+        numrepeat, avg, measure.repeat = (len(v_rabi),False,500) if mode == 'hbroadcast' else (300,True,len_data)
+        job = Job(rabi_seq, (measure,t_rabi,'shift',exstate,comwave,comwave,mode), tags=exstate, max=numrepeat,avg=avg, no_bar=True)
+        t_t, s_t = await job.done()
+        yield [j]*measure.n, t_t, s_t   
+
+###################################################
+###################################################
+
+async def vModulation_single(measure,t_rabi,v_rabi,dcstate=[],exstate=[],calimatrix=None,which={}):
+    dc = {i:0 for i in (dcstate+exstate)}
+    for i, k in enumerate(v_rabi):
+        output = True if i == 0 else False
+        dc[dcstate[0]] = k
+        task_z = await executeZwave(measure,cww.zWave_im,dcstate=dc,qnum=len(dc),calimatrix=calimatrix,output=output,args='imAmp',\
+            during=t_rabi/1e9,delta_im=120e6)
+        concurrence(task_z)
+        ch_A, ch_B, I, Q = await measure.ats.getIQ(hilbert=True)
+        Am, Bm = ch_A,ch_B
+        ss = Am + 1j*Bm
+        # d = list(zip(np.real(ss),np.imag(ss)))
+        d = [list(zip(np.real(ss)[:,i],np.imag(ss)[:,i])) for i in range(np.shape(ss)[1])]
+        y = [measure.predict[j](d[i]) for i, j in enumerate(measure.qubitToread)]
+        pop = np.count_nonzero(y,axis=1)/np.shape(y)[1]
+        pop = np.array([pop[i] if which[j] == 1 else 1-pop[i] for i, j in enumerate(measure.qubitToread)])
+        yield [k]*measure.n, pop
+
+async def vModulation_pop(measure,t_rabi,v_rabi,dcstate=[],exstate=[],calimatrix=None,which={}):
+    
+    # qubit_z, qubit_ex = measure.qubits[dcstate[0]], measure.qubits[exstate[0]]
+    # z_awg = measure.awg[qubit.inst['z_awg']]
+    # ex_awg = measure.awg[qubit.inst['ex_awg']]
+    # zname, zch = [f'ch{i}' for i in qubit.inst['z_ch']], qubit.inst['z_ch']
+    # exname, exch = [f'ch{i}' for i in qubit.inst['ex_ch']], qubit.inst['ex_ch']
+    # await cww.couldRun(measure,ex_awg,exch,exname)
+    # # await cww.couldRun(measure,z_awg,zch,zname)
+
+    for i, j in enumerate(t_rabi):
+        output = True if i == 0 else False
+        task = await executeEXwave(measure,cww.rabiWave,exstate=exstate,output=output,shift=j/1e9)
+        concurrence(task)
+        job = Job(vModulation_single, (measure,j,v_rabi,dcstate,exstate,calimatrix,which),max=len(v_rabi))
+        vv, sv = await job.done()
+        yield [j]*measure.n, vv, sv
+        
+
+async def phaseCali(measure,phase,mode='vbroadcast',dcstate=[],exstate=[],calimatrix=None):
+    len_data, t = len(phase), np.array([phase]*measure.n).T
+    qubit_z, qubit_ex = measure.qubits[dcstate[0]], measure.qubits[exstate[0]]
+    zname, z_awg = [f'ch{i}' for i in qubit_z.inst['z_ch']], measure.awg[qubit_z.inst['z_awg']]
+    zch = qubit_z.inst['z_ch']
+
+    dc = {i:0 for i in (dcstate+exstate)}
+    dc[dcstate[0]] = 0.3
+    current = await zManage(measure,dcstate=dc,qnum=len(dc),calimatrix=calimatrix)
+
+    pulse = await cww.funcarg(cww.zWave_im,qubit_z,during=100e-9,shift=200e-9,delta_im=120e6,volt=0,imAmp=current[dcstate[0]])
+    await cww.writeWave(measure,z_awg,zname,pulse)
+    await cww.couldRun(measure,z_awg,zch,namelist=zname)
+
+    task_ex = await executeEXwave(measure,cww.phaseCaliwave,exstate=exstate,output=True,t_run=300e-9)
+
+    task_zex = await executeZseq(measure,cww.Z_sequence_im,len_data,True,mode=mode,dcstate=exstate,\
+        v_or_t=phase,arg='phaseim',during=100e-9,shift=200e-9,volt=0,delta_im=120e6,imAmp=current[dcstate[0]])
+    concurrence([{**task_ex[0],**task_zex[0]},{**task_ex[1],**task_zex[1]}])
+
+    await measure.psg['psg_lo'].setValue('Output','ON')
+
+    for i in range(300):
+        ch_A, ch_B, I, Q = await measure.ats.getIQ()
+        Am, Bm = ch_A[1:len_data+1,:],ch_B[1:len_data+1,:]
+        # theta0 = np.angle(Am) - np.angle(Bm)
+        # Bm *= np.exp(1j*theta0)
+        s = Am + 1j*Bm
+        yield t, s - measure.base  
+
+async def freqCali(measure,t_run,mode='vbroadcast',dcstate=[],exstate=[]):
+    len_data, t = len(t_run), np.array([t_run]*measure.n).T
+    
+    # task_ex = await executeEXwave(measure,cww.phaseCaliwave,exstate=exstate,output=True,t_run=150e-9)
+    task_ex = await executeEXseq(measure,cww.Coherence_sequence,len_data,True,exstate,True,mode,\
+        v_or_t=(t_run+100)/1e9,arg='t_run')
+
+    task_zex = await executeZseq(measure,cww.Z_sequence,len_data,True,mode=mode,dcstate=exstate,\
+        v_or_t=t_run/1e9,arg='during',shift=200e-9)
+    concurrence([{**task_ex[0],**task_zex[0]},{**task_ex[1],**task_zex[1]}])
+
+    await measure.psg['psg_lo'].setValue('Output','ON')
+
+    for i in range(300):
+        ch_A, ch_B, I, Q = await measure.ats.getIQ()
+        Am, Bm = ch_A[1:len_data+1,:],ch_B[1:len_data+1,:]
+        # theta0 = np.angle(Am) - np.angle(Bm)
+        # Bm *= np.exp(1j*theta0)
+        s = Am + 1j*Bm
+        yield t, s - measure.base  
 
 ################################################################################
 # Ramsey
@@ -1337,7 +1726,7 @@ async def vRabi(measure,t_rabi,v_rabi,mode='vbroadcast',dcstate=[],exstate=[],im
 
 async def Ramsey(measure,t_run,exstate=[]):
 
-    await cww.couldRun(measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
+    await cww.couldRun(measure,measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
     qubit = measure.qubits[exstate[0]]
     namelist = [f'ch{i}' for i in qubit.inst['ex_ch']]
     chlist = qubit.inst['ex_ch']
@@ -1345,12 +1734,12 @@ async def Ramsey(measure,t_run,exstate=[]):
 
     await measure.psg['psg_lo'].setValue('Output','ON')
     # await measure.psg[qubit.inst['ex_lo']].setValue('Output','ON')
-    await cww.couldRun(awg_ex,chlist,namelist=namelist)
+    await cww.couldRun(measure,awg_ex,chlist,namelist=namelist)
 
     for i in t_run:
         # pulselist = await cww.funcarg(cww.coherenceWave,qubit,t_run=i/1e9)
-        # await cww.writeWave(awg_ex,name=namelist,pulse=pulselist)
-        # await cww.couldRun(awg_ex)
+        # await cww.writeWave(measure,awg_ex,name=namelist,pulse=pulselist)
+        # await cww.couldRun(measure,awg_ex)
         task = await executeEXwave(measure,cww.coherenceWave,exstate=exstate,t_run=i/1e9)
         concurrence(task)
         ch_A, ch_B, I, Q = await measure.ats.getIQ()
@@ -1367,7 +1756,7 @@ async def Ramsey(measure,t_run,exstate=[]):
 ################################################################################
 
 async def SpinEcho(measure,t_run,exstate=[]):
-    await cww.couldRun(measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
+    await cww.couldRun(measure,measure.awg['awgread'],[1,5],['Readout_I','Readout_Q'])
     qubit = measure.qubits[exstate[0]]
     namelist = [f'ch{i}' for i in qubit.inst['ex_ch']]
     chlist = qubit.inst['ex_ch']
@@ -1375,11 +1764,11 @@ async def SpinEcho(measure,t_run,exstate=[]):
 
     await measure.psg['psg_lo'].setValue('Output','ON')
     # await measure.psg[qubit.inst['ex_lo']].setValue('Output','ON')
-    await cww.couldRun(awg_ex,chlist,namelist=namelist)
+    await cww.couldRun(measure,awg_ex,chlist,namelist=namelist)
     for i in t_run:
         # pulselist = await cww.funcarg(cww.coherenceWave,qubit,t_run=i/1e9)
-        # await cww.writeWave(awg_ex,name=namelist,pulse=pulselist)
-        # await cww.couldRun(awg_ex)
+        # await cww.writeWave(measure,awg_ex,name=namelist,pulse=pulselist)
+        # await cww.couldRun(measure,awg_ex)
         task = await executeEXwave(measure,cww.coherenceWave,exstate=exstate,t_run=i/1e9)
         concurrence(task)
         ch_A, ch_B, I, Q = await measure.ats.getIQ()
@@ -1413,15 +1802,15 @@ async def crosstalkSpec(measure,v_rabi,dcstate=[],exstate=[],comwave=False):
     qubit_ex = measure.qubits[exstate[0]]
     await measure.psg['psg_trans'].setValue('Frequency',qubit_ex.f_ex)
     await measure.psg['psg_trans'].setValue('Output','ON')
-    task_z = await executeZseq(measure,cww.Z_sequence,len_data,comwave,dcstate=exstate,v_or_t=v_rabi,arg='volt',pi_len=27000/1e9,shift=200/1e9)
+    task_z = await executeZseq(measure,cww.Z_sequence,len_data,comwave,dcstate=exstate,v_or_t=v_rabi,arg='volt',during=27000/1e9,shift=200/1e9)
     concurrence(task_z)
 
     await measure.psg['psg_lo'].setValue('Output','ON')
     for i in np.linspace(-1,1,11):
 
-        pulse = await cww.funcarg(cww.zWave,qubit_zz,pi_len=27000/1e9,volt=i,shift=200/1e9)
-        await cww.writeWave(zz_awg,zname,pulse,mark=False)
-        await cww.couldRun(zz_awg,namelist=zname,chlist=zch)
+        pulse = await cww.funcarg(cww.zWave,qubit_zz,during=27000/1e9,volt=i,shift=200/1e9)
+        await cww.writeWave(measure,zz_awg,zname,pulse,mark=False)
+        await cww.couldRun(measure,zz_awg,namelist=zname,chlist=zch)
         job = Job(single_cs,(measure,t,len_data),avg=True,max=300,auto_save=False,no_bar=True)
         v_bias, s =await job.done()
         n = np.shape(s)[1]
@@ -1432,7 +1821,7 @@ async def crosstalkSpec(measure,v_rabi,dcstate=[],exstate=[],comwave=False):
 ################################################################################
 
 async def RTO_Notomo(measure,t_run,exstate=[]):
-    await cww.couldRun(measure.awg['awgread'],[1,5])
+    await cww.couldRun(measure,measure.awg['awgread'],[1,5])
     qubit = measure.qubits[exstate[0]]
     namelist = [f'ch{i}' for i in qubit.inst['ex_ch']]
     chlist = qubit.inst['ex_ch']
@@ -1443,8 +1832,8 @@ async def RTO_Notomo(measure,t_run,exstate=[]):
 
     for i in t_run:
         pulselist = await cww.funcarg(cww.coherenceWave,qubit,t_run=500/1e9)
-        await cww.writeWave(awg_ex,name=namelist,pulse=pulselist)
-        await cww.couldRun(awg_ex,chlist)
+        await cww.writeWave(measure,awg_ex,name=namelist,pulse=pulselist)
+        await cww.couldRun(measure,awg_ex,chlist)
         ch_A, ch_B, I, Q = await measure.ats.getIQ()
         Am, Bm = ch_A.mean(axis=0),ch_B.mean(axis=0)
         # Im, Qm = I.mean(axis=0), Q.mean(axis=0)
