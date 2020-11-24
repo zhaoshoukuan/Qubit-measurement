@@ -328,7 +328,8 @@ if len(delayParasAND2nd)>3:
     pPoly_2nd = para2nd[6:-3]
     tCut2,tShift2,sigma2 = para2nd[-3:]
     timeFunData2 = np.sum(pExp0_2nd[0::2,None]*np.exp(-pExp0_2nd[1::2,None]*tlist[None,:]), axis=0)
-    timeFunData2 += pExp1_2nd[0]*np.exp(-pExp1_2nd[1]*tlist)*np.polyval(pPoly_2nd,tlist)*(tlist<=tCut2+20)*(0.5-0.5*scipy.special.erf(sigma2*(tlist-tCut2+tShift2)))*(0.5+0.5*scipy.special.erf(4.0*(tlist-3+0.5)))
+    timeFunData2 += pExp1_2nd[0]*np.exp(-pExp1_2nd[1]*tlist)*np.polyval(pPoly_2nd,tlist)*(tlist<=tCut2+20)*\
+        (0.5-0.5*scipy.special.erf(sigma2*(tlist-tCut2+tShift2)))*(0.5+0.5*scipy.special.erf(4.0*(tlist-3+0.5)))
     timeFunDataf2 = np.fft.rfft(timeFunData2)
     precalc = precalc/(1.0+timeFunDataf2*i_two_pi_freqs/samplingRate)
 
@@ -529,4 +530,3 @@ def deconvolvePulseShape(ts,result,tcut=500,w=7.0):
     result1 = np.array([tsExp,timeFunDataExpDe]).T
     return result1
 
-fft

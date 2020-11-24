@@ -18,13 +18,15 @@ from qulab.waveform import CosPulseDrag, Expi, DC, Step, Gaussian, CosPulse
 from qulab import waveform_new as wn
 from tqdm import tqdm_notebook as tqdm
 import asyncio, inspect
-from qulab import imatrix as mx, dataTools as dt
+from qulab import imatrix as mx, dataTools as dt, optimize
 import functools
+import imp 
+op = imp.reload(optimize)
 # from qulab import measurement_wave as mrw
 
-
-t_list = np.linspace(0,100000,250000)
-t_new = np.linspace(-90000,10000,250000)*1e-9
+t_new = np.linspace(-15000,5000,50000)*1e-9
+# t_new = np.linspace(-90000,10000,250000)*1e-9
+t_list = t_new*1e9 - np.min(t_new)*1e9
 t_range = (-90e-6, 10e-6)
 sample_rate = 2.5e9
 
@@ -247,7 +249,7 @@ async def couldRun(measure,awg,chlist=None,namelist=None):
     # time.sleep(5)
     while True:
         x = await awg.run_state()
-        time.sleep(0.4)
+        time.sleep(0.2)
         if x == 1 or x == 2:
             await measure.awg['awg_trig100'].run()
             for i in range(4):
@@ -300,7 +302,7 @@ async def clearSeq(measure,awg):
 async def awgchmanage(measure,awg,seqname,ch):
     await awg.stop()
     await awg.use_sequence(seqname,channels=ch)
-    time.sleep(5)
+    time.sleep(15)
     # await awg.query('*OPC?')
     for i in ch:
         await awg.output_on(ch=i)
@@ -391,20 +393,6 @@ async def gen_packSeq(measure,kind,awg,name,steps,readseq=True,mode='vbroadcast'
 
         await genSeq(measure,measure.awg['awgread'],'Read',mode=mode)
         await awgchmanage(measure,measure.awg['awgread'],'Read',[1,5])
-        
-################################################################################
-# awgDC波形
-################################################################################
-
-async def awgDC(awg,wavname,volt):
-    await awg.stop()
-    # init = DC(offset=-0.7, length=100e-6, range=(0,1))*0 + volt
-    # wav = init
-    init  = ((Step(2e-9)<<3000e-9) - Step(2e-9))*volt
-    wav = (init >> 2250e-9)
-    wav.set_range(*t_range)
-    points = wav.generateData(sample_rate)
-    await awg.update_waveform(points,wavname)
 
 ################################################################################
 # Z波形矫正
@@ -458,53 +446,73 @@ def predistort(waveform, sRate, zCali=[0]*10):
 
     return np.real(yc)
 
-def fitfunc(t, p):
-    #p[2::2] = p[2::2] 
-    return (t > 0) * (p[0] + np.sum(p[1::2,None]*np.exp(-p[2::2,None]*t[None,:]), axis=0))
+def expcaliZ(waveform,paras):
 
-def caliZ(waveform,paras):
-    
+    def fitfunc(t, p):
+        #p[2::2] = p[2::2] 
+        return (t > 0) * (np.sum(p[1::2,None]*np.exp(-p[2::2,None]*t[None,:]), axis=0))
+
+    if isinstance(paras, dict):
+        return waveform
+    waveform = waveform[0]
+    length = len(waveform)
     paras[0] = 0
-    x = np.arange(250000)*0.4
+    x = np.arange(length)*0.4
     response = fitfunc(x,paras)
-    f_cali = 1+1j*np.pi*np.fft.fftfreq(len(x),0.4)*np.fft.fft(response)
+    f_cali = 1/(1+1j*np.pi*np.fft.fftfreq(len(x),0.4)*np.fft.fft(response))
     f_step = np.fft.fft(waveform)
     signal = np.real(np.fft.ifft(f_step*f_cali))
-    return signal
+    return (signal,)
 
-# def caliZ(waveform,paras):
-#     samplingRate = 2.5
-#     nrfft = 125001
-#     nfft = 2*(nrfft-1)
-#     freqs = np.linspace(0, nrfft*1.0/nfft*samplingRate,nrfft, endpoint=False)
-#     # freqs = np.fft.rfftfreq(nfft,1/samplingRate)
-#     # freqs = np.fft.fftfreq(250000,0.4)
-#     i_two_pi_freqs = 2j*np.pi*freqs
+def polycaliZ(waveform,paras):
+
+    # def smoothfilt(f,h):
+    #     f0, sigma = 0.05, 0.02
+    #     return 1+0.5*(1/h-1)*(np.tanh((f-f0)/sigma)+1)
+
+    waveform = waveform[0]
+    length = len(waveform)
+    # height = np.max(waveform)-np.min(waveform)
+    samplingRate = 2.5
+    nrfft = length/2+1
+    nfft = 2*(nrfft-1)
+    # freqs = np.linspace(0, nrfft*1.0/nfft*samplingRate,nrfft, endpoint=False)
+    freqs = np.fft.rfftfreq(int(nfft),1/samplingRate)
+    # freqs = np.fft.fftfreq(length,0.4)
+    i_two_pi_freqs = 2j*np.pi*freqs
     
-#     precalc = 1.0
-#     for i in paras:
-#         timeFunData = 0.0
-#         if paras[i] != {}:
-#             expAmpRates, polyParas, delayParasAND2nd = np.array(paras[i]['pexp']), np.array(paras[i]['ppoly']),\
-#                  np.array(paras[i]['time'])
-#         else:
-#             continue
-#         pExp0 = expAmpRates
-#         pExp1 = polyParas[:2]
-#         pPoly = polyParas[2:]
-#         tCut,tShift,tstart,sigma1 = delayParasAND2nd
-#         tlist = np.arange(2*(nrfft-1),dtype=float)/samplingRate
-#         # tlist = np.arange(250000,dtype=float)/samplingRate
-#         if len(pExp0) > 1:
-#             timeFunData += np.sum(pExp0[1::2,None]*np.exp(-pExp0[2::2,None]*tlist[None,:]), axis=0)
-#         timeFunData += pExp1[0]*np.exp(-pExp1[1]*tlist)*np.polyval(pPoly,tlist)*(tlist<=tCut+20)*\
-#         (0.5-0.5*scipy.special.erf(sigma1*(tlist-tCut+tShift)))*(0.5+0.5*scipy.special.erf(4.0*(tlist-tstart+0.5)))
-#         timeFunDataf = np.fft.rfft(timeFunData)
-#         precalc /= (1.0+timeFunDataf*i_two_pi_freqs/samplingRate)
-#     f_cali = precalc
-#     f_step = np.fft.rfft(waveform)
-#     signal = np.real(np.fft.irfft(f_step*f_cali))
-#     return signal
+    precalc = 1.0
+    for i in paras:
+        timeFunData = 0.0
+        if paras[i] != {}:
+            expAmpRates, polyParas, delayParasAND2nd = np.array(paras[i]['pexp']), np.array(paras[i]['ppoly']),\
+                 np.array(paras[i]['time'])
+        else:
+            continue
+        pExp0 = expAmpRates
+        pExp1 = polyParas[:2]
+        pPoly = polyParas[2:]
+        tCut,tShift,tstart,sigma1 = delayParasAND2nd
+        # tlist = np.arange(2*(nrfft-1),dtype=float)/samplingRate
+        tlist = np.arange(length,dtype=float)/samplingRate
+        if len(pExp0) > 1:
+            timeFunData += np.sum(pExp0[1::2,None]*np.exp(-pExp0[2::2,None]*tlist[None,:]), axis=0)
+        timeFunData += pExp1[0]*np.exp(-pExp1[1]*tlist)*np.polyval(pPoly,tlist)*(tlist<=tCut+20)*\
+        (0.5-0.5*scipy.special.erf(sigma1*(tlist-tCut+tShift)))*(0.5+0.5*scipy.special.erf(4.0*(tlist-tstart+0.5)))
+        timeFunDataf = np.fft.rfft(timeFunData)
+        # timeFunDataf *= smoothfilt(freqs,timeFunDataf)
+        precalc /= (1.0+timeFunDataf*i_two_pi_freqs/samplingRate)
+    f_cali = precalc
+    f_step = np.fft.rfft(waveform)
+    signal = np.fft.irfft(f_step*f_cali)
+    # signal = op.RowToRipe().smooth(np.fft.irfft(f_step*f_cali),0.4)
+    return (np.real(signal),)
+
+def caliZ(waveform,paras):
+    if isinstance(paras, dict):
+        return polycaliZ(waveform,paras)
+    else:
+        return expcaliZ(waveform,paras)
 
 ################################################################################
 # 更新波形
@@ -605,33 +613,6 @@ async def ats_setup(ats,delta,l=1000,repeats=300,mode=None,weight=None):
 # 读出混频
 ################################################################################
 
-# async def readWave(measure,delta,readlen=1100,repeats=512,phase=0.0):
-    
-#     readamp = measure.readamp
-#     twidth, n, measure.readlen, measure.repeat = readlen, len(delta), readlen, (repeats // 64 + 1) * 64
-#     wavelen = (twidth // 64) * 64
-#     if wavelen < twidth:
-#         wavelen += 64
-#     measure.wavelen = int(wavelen) 
-
-#     ringup = 100
-#     # pulse1 = wn.square((wavelen-ringup)/1e9) >> ((wavelen+ringup)/ 1e9 / 2)
-#     pulse1 = wn.square(wavelen/1e9) >> (wavelen/ 1e9 / 2 + ringup / 1e9)
-#     pulse2 = wn.square(ringup/1e9)>>(ringup/2/1e9)
-#     pulse = readamp*pulse1+pulse2*0.8
-
-#     mrkp1 = wn.square(25000e-9) << (25000e-9 / 2 + 500e-9)
-#     mrkp2 = wn.square(wavelen/1e9) >> (wavelen / 1e9 / 2 + 440 / 1e9 + ringup / 1e9)
-#     # mrkp3 = wn.square(4000/1e9) >> 1000/1e9
-#     mrkp4 = wn.square(5000/1e9) << (2500+84999)/1e9
-#     I, Q = wn.zero(), wn.zero()
-#     for i in delta:
-#         wav_I, wav_Q = wn.mixing(pulse,phase=phase,freq=i,ratioIQ=-1.0)
-#         I, Q = I + wav_I, Q + wav_Q
-#     I, Q = I / n, Q / n
-#     pulselist = I, Q, np.array((mrkp2,mrkp4,mrkp4,mrkp4)), np.array((mrkp2,mrkp4,mrkp1,mrkp4))
-#     return pulselist
-
 async def readWave(measure,delta,readlen=1100,repeats=512,phase=0.0):
     readamp = measure.readamp
     ringup = measure.ringup
@@ -653,8 +634,8 @@ async def readWave(measure,delta,readlen=1100,repeats=512,phase=0.0):
         I, Q = I + wav_I, Q + wav_Q
     I, Q = I , Q 
 
-    mrkp1 = wn.square(25000e-9) << (25000e-9 / 2 + 500e-9)
-    mrkp2 = wn.square(wavelen/1e9) >> (wavelen / 1e9 / 2 + 270 / 1e9 + 2*np.max(ringup) / 1e9)
+    mrkp1 = wn.square(len(measure.t_new)/4e9) << (len(measure.t_new)/8e9 + 500e-9)
+    mrkp2 = wn.square(wavelen/1e9) >> (wavelen / 1e9 / 2 + 370 / 1e9 + 2*np.max(ringup) / 1e9)
     # mrkp3 = wn.square(4000/1e9) >> 1000/1e9
     mrkp4 = wn.square(5000/1e9) << (2500+84999)/1e9
     
@@ -835,7 +816,7 @@ async def acstarkSequence(measure,kind,v_or_t,arg,**paras):
 ################################################################################
 
 
-async def zWave(volt=0.4,during=0e-9,shift=0e-9,offset=0,timing={'z>xy':0,'read>xy':0},zCali=None):
+async def zWave(volt=0.4,during=0e-9,shift=0e-9,offset=0,timing={'z>xy':0,'read>xy':0},zCali=None,readvolt=0):
     shift += timing['read>xy'] - timing['z>xy']
     pulse = (wn.square(during,0e-9) << (during/2 + shift)) * volt + offset
     # if during >= 2e-9 and volt !=0:
@@ -844,7 +825,11 @@ async def zWave(volt=0.4,during=0e-9,shift=0e-9,offset=0,timing={'z>xy':0,'read>
     #         pulse += pulse_overshot
     #     else:
     #         pulse -= pulse_overshot
+    pulse_read = (wn.square(3000e-9,0e-9) >> (3000e-9/2)) * readvolt 
+    pulse += pulse_read
+
     pulselist = (pulse,) 
+    # t = np.linspace(-90000,10000,100000)*1e-9
     return pulseTowave(pulselist) if zCali is None else caliZ(pulseTowave(pulselist),zCali)
 
 async def specf2v(specfuncz,f_ex,volt=0,during=0e-9,shift=0e-9,timing={'z>xy':0,'read>xy':0},zCali=None,delta_im=0,imAmp=0):
@@ -931,6 +916,9 @@ async def singleQgate(envelopename=['square',1],pi_len=30e-9,amp=1,shift=0,delta
     if axis == 'X':
         phi = 0
         wav_I, wav_Q = wn.mixing(envelope_pi,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
+    if axis == 'Xn':
+        phi = np.pi
+        wav_I, wav_Q = wn.mixing(envelope_pi,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Xhalf':
         phi = 0
         wav_I, wav_Q = wn.mixing(envelope_half,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
@@ -939,6 +927,9 @@ async def singleQgate(envelopename=['square',1],pi_len=30e-9,amp=1,shift=0,delta
         wav_I, wav_Q = wn.mixing(envelope_half,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Y':
         phi = np.pi/2
+        wav_I, wav_Q = wn.mixing(envelope_pi,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
+    if axis == 'Yn':
+        phi = -np.pi/2
         wav_I, wav_Q = wn.mixing(envelope_pi,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Ynhalf':
         phi = -np.pi/2
