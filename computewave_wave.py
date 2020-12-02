@@ -249,7 +249,7 @@ async def couldRun(measure,awg,chlist=None,namelist=None):
     # time.sleep(5)
     while True:
         x = await awg.run_state()
-        time.sleep(0.2)
+        time.sleep(0.4)
         if x == 1 or x == 2:
             await measure.awg['awg_trig100'].run()
             for i in range(4):
@@ -302,11 +302,11 @@ async def clearSeq(measure,awg):
 async def awgchmanage(measure,awg,seqname,ch):
     await awg.stop()
     await awg.use_sequence(seqname,channels=ch)
-    time.sleep(15)
+    time.sleep(5)
     # await awg.query('*OPC?')
     for i in ch:
         await awg.output_on(ch=i)
-    await couldRun(measure,awg)
+    # await couldRun(measure,awg)
     return
 
 ################################################################################
@@ -336,17 +336,19 @@ async def subSeq(measure,awg,subkind,wavename):
 
 async def genSeq(measure,awg,kind,mode='vbroadcast'):
     await awg.stop()
-    await awg.create_waveform(name='zero', length=2500, format=None)
+    await awg.remove_sequence(kind)
+    time.sleep(1)
+    # await awg.create_waveform(name='zero', length=2500, format=None)
     
     if mode == 'vbroadcast' or 1:
-        # await awg.create_sequence(kind,(len(measure.wave[kind][0])+1),2)
-        await awg.create_sequence(kind,1000,2)
+        await awg.create_sequence(kind,(len(measure.wave[kind][0])+1),2)
+        # await awg.create_sequence(kind,400,2)
         await ats_setup(measure.ats,measure.delta,l=measure.readlen,repeats=len(measure.wave[kind][0]),mode='vbroadcast')
         wait = 'ATR' if awg == measure.awg['awg_trig'] else 'ATR'
         for j,i in enumerate(measure.wave[kind][:2],start=1):
             await awg.set_seq(i,1,j,seq_name=kind,wait=wait,firstwait='BTR')
-            for k in np.arange((len(i)+2),1001):
-                await awg.write('SLIS:SEQ:STEP%d:TASS%d:WAV "%s","%s"' %(k, j, kind, 'zero'))
+            # for k in np.arange((len(i)+2),1001):
+            #     await awg.write('SLIS:SEQ:STEP%d:TASS%d:WAV "%s","%s"' %(k, j, kind, 'zero'))
 
     # if mode == 'hbroadcast':
     #     repeat = measure.repeat
@@ -387,12 +389,12 @@ async def gen_packSeq(measure,kind,awg,name,steps,readseq=True,mode='vbroadcast'
     #     await clearSeq(measure,'awgread')
     await create_wavelist(measure,kind,(awg,name,steps,len(measure.t_list),mode))
     await genSeq(measure,awg,kind,mode=mode)
-    if readseq:
-        measure.wave['Read'] = [['Readout_I']*steps,['Readout_Q']*steps,['Read_sub']*steps]
-        # await measure.awg['awgread'].create_sequence('Read_sub',2,2)
+    # if readseq:
+    #     measure.wave['Read'] = [['Readout_I']*steps,['Readout_Q']*steps,['Read_sub']*steps]
+    #     # await measure.awg['awgread'].create_sequence('Read_sub',2,2)
 
-        await genSeq(measure,measure.awg['awgread'],'Read',mode=mode)
-        await awgchmanage(measure,measure.awg['awgread'],'Read',[1,5])
+    #     await genSeq(measure,measure.awg['awgread'],'Read',mode=mode)
+    #     await awgchmanage(measure,measure.awg['awgread'],'Read',[1,5])
 
 ################################################################################
 # Z波形矫正
@@ -634,8 +636,8 @@ async def readWave(measure,delta,readlen=1100,repeats=512,phase=0.0):
         I, Q = I + wav_I, Q + wav_Q
     I, Q = I , Q 
 
-    mrkp1 = wn.square(len(measure.t_new)/4e9) << (len(measure.t_new)/8e9 + 500e-9)
-    mrkp2 = wn.square(wavelen/1e9) >> (wavelen / 1e9 / 2 + 370 / 1e9 + 2*np.max(ringup) / 1e9)
+    mrkp1 = wn.square(len(measure.t_new)/2.5/2e9) << (len(measure.t_new)/2.5/2/2e9 + 500e-9)
+    mrkp2 = wn.square(wavelen/1e9) >> (wavelen / 1e9 / 2 + 375 / 1e9 + 2*np.max(ringup) / 1e9)
     # mrkp3 = wn.square(4000/1e9) >> 1000/1e9
     mrkp4 = wn.square(5000/1e9) << (2500+84999)/1e9
     
@@ -903,7 +905,7 @@ async def Z_sequence(qubit,measure,kind,v_or_t,arg,**paras):
 ################################################################################
 
 async def singleQgate(envelopename=['square',1],pi_len=30e-9,amp=1,shift=0,delta_ex=110e6,axis='X',\
-    DRAGScaling=None,phaseDiff=0,timing={'z>xy':0,'read>xy':0}):
+    DRAGScaling=None,phaseDiff=0,timing={'z>xy':0,'read>xy':0},phase=0.0):
     
     shift += timing['read>xy']
     if envelopename[1] == 1:
@@ -939,6 +941,12 @@ async def singleQgate(envelopename=['square',1],pi_len=30e-9,amp=1,shift=0,delta
         wav_I, wav_Q = wn.mixing(envelope_half,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     if axis == 'Z':
         wav_I, wav_Q = wn.zero(), wn.zero()
+    if axis == 'AnyRhalf':
+        phi = phase
+        wav_I, wav_Q = wn.mixing(envelope_half,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
+    if axis == 'AnyRpi':
+        phi = phase
+        wav_I, wav_Q = wn.mixing(envelope_pi,phase=phi,freq=delta_ex,ratioIQ=-1.0,phaseDiff=phaseDiff,DRAGScaling=DRAGScaling)
     return pulseTowave((wav_I, wav_Q, (wn.zero(),), (wn.zero(),)))
 
 ################################################################################
